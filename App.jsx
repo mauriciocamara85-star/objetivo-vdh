@@ -15,12 +15,14 @@ const TEMA_KEY = "vdh-objetivo-tema";
 const DB_DOC_PATH = "app/data"; // documento compartido cuando la capacidad "db" está disponible
 const DATA_VERSION = 2;
 const DIAS_SEMANA = ["L", "M", "M", "J", "V", "S", "D"];
+const DIAS_SEMANA_LARGO = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
 // Convierte el índice de DIAS_SEMANA (0=Lun...6=Dom) al valor que devuelve Date.getDay() (0=Dom...6=Sab).
 const JS_WEEKDAY_DE_INDICE = [1, 2, 3, 4, 5, 6, 0];
 const MESES = [
   "Enero","Febrero","Marzo","Abril","Mayo","Junio",
   "Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre",
 ];
+const MESES_CORTO = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"];
 
 // Paleta prolija y fija para identificar vendedores en el calendario compartido.
 // Se asigna en orden a medida que se agregan vendedores (no es elegible a mano).
@@ -53,6 +55,41 @@ function esHoy(y, m, d) {
   const t = new Date();
   return t.getFullYear() === y && t.getMonth() + 1 === m && t.getDate() === d;
 }
+function hoyComoFecha() {
+  const t = new Date();
+  return { year: t.getFullYear(), month: t.getMonth() + 1, day: t.getDate() };
+}
+function sumarDias(date, n) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + n);
+  return d;
+}
+// Lunes 00:00 de la semana que contiene `date`.
+function lunesDeLaSemana(date) {
+  const d = new Date(date);
+  const dia = d.getDay(); // 0=Dom...6=Sab
+  const diff = dia === 0 ? -6 : 1 - dia;
+  d.setDate(d.getDate() + diff);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+function diasDeLaSemana(inicio) {
+  const arr = [];
+  for (let i = 0; i < 7; i++) arr.push(sumarDias(inicio, i));
+  return arr;
+}
+function fmtRangoSemana(inicio) {
+  const fin = sumarDias(inicio, 6);
+  const mismoMes = inicio.getMonth() === fin.getMonth();
+  const mismoAnio = inicio.getFullYear() === fin.getFullYear();
+  if (mismoMes) return `${inicio.getDate()}–${fin.getDate()} ${MESES_CORTO[inicio.getMonth()]} ${inicio.getFullYear()}`;
+  if (mismoAnio) return `${inicio.getDate()} ${MESES_CORTO[inicio.getMonth()]} – ${fin.getDate()} ${MESES_CORTO[fin.getMonth()]} ${inicio.getFullYear()}`;
+  return `${inicio.getDate()} ${MESES_CORTO[inicio.getMonth()]} ${inicio.getFullYear()} – ${fin.getDate()} ${MESES_CORTO[fin.getMonth()]} ${fin.getFullYear()}`;
+}
+function fmtFechaLarga(fecha) {
+  const d = new Date(fecha.year, fecha.month - 1, fecha.day);
+  return `${DIAS_SEMANA_LARGO[d.getDay()]} ${fecha.day} de ${MESES[fecha.month - 1]}`;
+}
 // Cerrado por patrón semanal fijo (ej. "cerramos los domingos") o por fecha puntual (feriado).
 function estaCerrado(local, y, m, d) {
   const key = dateKey(y, m, d);
@@ -82,11 +119,6 @@ function domingoDePascua(year) {
   const mes = Math.floor((h + l - 7 * m + 114) / 31);
   const dia = ((h + l - 7 * m + 114) % 31) + 1;
   return new Date(year, mes - 1, dia);
-}
-function sumarDias(date, n) {
-  const d = new Date(date);
-  d.setDate(d.getDate() + n);
-  return d;
 }
 // Feriados nacionales de Argentina de fecha fija o calculable (Pascua). Los feriados "puente
 // turístico" los decreta el gobierno cada año y no se pueden calcular: se cargan a mano como
@@ -198,6 +230,23 @@ function huecosDelDia(vendedores, key, horaInicio, horaFin) {
   return huecos.filter(([a, b]) => b > a).map(([a, b]) => ({ inicio: minAHHMM(a), fin: minAHHMM(b) }));
 }
 
+// Distribuye turnos que se solapan en columnas lado a lado (como Google Calendar) usando un
+// algoritmo greedy: mismo ancho de columna para todos los eventos del día, simple y suficiente
+// para la cantidad de vendedores de un local.
+function disponerEventos(eventos) {
+  const ordenados = [...eventos].sort((a, b) => a.inicioMin - b.inicioMin || a.finMin - b.finMin);
+  const columnas = [];
+  const resultado = [];
+  ordenados.forEach((ev) => {
+    let col = columnas.findIndex((finMin) => finMin <= ev.inicioMin);
+    if (col === -1) { col = columnas.length; columnas.push(ev.finMin); }
+    else columnas[col] = ev.finMin;
+    resultado.push({ ...ev, col });
+  });
+  const totalCols = Math.max(1, columnas.length);
+  return resultado.map((ev) => ({ ...ev, totalCols }));
+}
+
 function defaultVendedor(nombre, colorIndex) {
   return {
     id: uid(),
@@ -294,8 +343,10 @@ export default function App() {
   // Estado de navegación y preferencias visuales: de cada persona/dispositivo, no se sincroniza.
   const [localActivoId, setLocalActivoId] = useState(null);
   const [vendedorActivo, setVendedorActivo] = useState(null);
-  const [diaSeleccionado, setDiaSeleccionado] = useState(null);
+  const [fechaSeleccionada, setFechaSeleccionada] = useState(null); // { year, month, day } | null
   const [localOpen, setLocalOpen] = useState(false);
+  const [vista, setVista] = useState("mes"); // "mes" | "semana" | "dia"
+  const [semanaInicio, setSemanaInicio] = useState(() => lunesDeLaSemana(now));
   const [tema, setTema] = useState(() => {
     try {
       const t = localStorage.getItem(TEMA_KEY);
@@ -493,12 +544,12 @@ export default function App() {
     setSharedData((d) => ({ ...d, locales: [...d.locales, nl] }));
     setLocalActivoId(nl.id);
     setVendedorActivo(nl.vendedores[0].id);
-    setDiaSeleccionado(null);
+    setFechaSeleccionada(null);
   };
   const switchLocal = (l) => {
     setLocalActivoId(l.id);
     setVendedorActivo(l.vendedores[0]?.id || null);
-    setDiaSeleccionado(null);
+    setFechaSeleccionada(null);
   };
   const removeLocal = (lid) => {
     if (sharedData.locales.length <= 1) return;
@@ -508,7 +559,7 @@ export default function App() {
       setLocalActivoId(locales[0].id);
       setVendedorActivo(locales[0].vendedores[0]?.id || null);
     }
-    setDiaSeleccionado(null);
+    setFechaSeleccionada(null);
   };
 
   const cambiarMes = (delta) => {
@@ -518,21 +569,54 @@ export default function App() {
       if (m > 12) { m = 1; y += 1; }
       return { year: y, month: m };
     });
-    setDiaSeleccionado(null);
+  };
+
+  const cambiarVista = (nueva) => {
+    if (nueva === vista) return;
+    if (nueva === "mes") {
+      const base = fechaSeleccionada || { year: mesVista.year, month: mesVista.month, day: 1 };
+      setMesVista({ year: base.year, month: base.month });
+    } else {
+      const base = fechaSeleccionada
+        ? new Date(fechaSeleccionada.year, fechaSeleccionada.month - 1, fechaSeleccionada.day)
+        : new Date(mesVista.year, mesVista.month - 1, 1);
+      setSemanaInicio(lunesDeLaSemana(base));
+    }
+    setVista(nueva);
+  };
+
+  const navPrev = () => {
+    if (vista === "mes") cambiarMes(-1);
+    else if (vista === "semana") setSemanaInicio((s) => sumarDias(s, -7));
+    else {
+      const base = fechaSeleccionada || hoyComoFecha();
+      const d = sumarDias(new Date(base.year, base.month - 1, base.day), -1);
+      setFechaSeleccionada({ year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate() });
+    }
+  };
+  const navNext = () => {
+    if (vista === "mes") cambiarMes(1);
+    else if (vista === "semana") setSemanaInicio((s) => sumarDias(s, 7));
+    else {
+      const base = fechaSeleccionada || hoyComoFecha();
+      const d = sumarDias(new Date(base.year, base.month - 1, base.day), 1);
+      setFechaSeleccionada({ year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate() });
+    }
   };
   const irAHoy = () => {
     const t = new Date();
     setMesVista({ year: t.getFullYear(), month: t.getMonth() + 1 });
-    setDiaSeleccionado(t.getDate());
+    setSemanaInicio(lunesDeLaSemana(t));
+    setFechaSeleccionada({ year: t.getFullYear(), month: t.getMonth() + 1, day: t.getDate() });
   };
 
-  const setTurnosDia = (v, d, turnos) => {
-    const key = dateKey(year, month, d);
+  const setTurnosDia = (v, fecha, turnos) => {
+    const key = dateKey(fecha.year, fecha.month, fecha.day);
     updateVendedor(v.id, { dias: { ...v.dias, [key]: { turnos } } });
   };
 
-  const quitarDiaVendedor = (v, d) => {
-    const key = dateKey(year, month, d);
+  const quitarDiaVendedor = (v, fecha) => {
+    const key = dateKey(fecha.year, fecha.month, fecha.day);
     const dias = { ...v.dias };
     delete dias[key];
     updateVendedor(v.id, { dias });
@@ -582,6 +666,28 @@ export default function App() {
     return copiados;
   };
 
+  // Copia la semana (real, lunes a domingo) inmediatamente anterior a `semanaInicio` — la que
+  // se está viendo en la vista Semana/Día — sin pisar días que ya tengan algo cargado. A
+  // diferencia de "repetir 1ª semana", funciona desde cualquier semana y cruza meses sin problema.
+  const copiarSemanaAnteriorVendedor = (v) => {
+    const dias = { ...v.dias };
+    let copiados = 0;
+    for (let i = 0; i < 7; i++) {
+      const actual = sumarDias(semanaInicio, i);
+      const anterior = sumarDias(semanaInicio, i - 7);
+      const keyActual = dateKey(actual.getFullYear(), actual.getMonth() + 1, actual.getDate());
+      const keyAnterior = dateKey(anterior.getFullYear(), anterior.getMonth() + 1, anterior.getDate());
+      if (dias[keyActual] !== undefined) continue;
+      const origen = v.dias[keyAnterior];
+      if (origen && origen.turnos && origen.turnos.length) {
+        dias[keyActual] = { turnos: origen.turnos.map((t) => ({ ...t })) };
+        copiados++;
+      }
+    }
+    if (copiados > 0) updateVendedor(v.id, { dias });
+    return copiados;
+  };
+
   const resetMes = () => {
     updateLocal({
       vendedores: local.vendedores.map((v) => {
@@ -592,7 +698,7 @@ export default function App() {
         return { ...v, dias };
       }),
     });
-    setDiaSeleccionado(null);
+    setFechaSeleccionada(null);
   };
 
   // Cálculos
@@ -620,6 +726,11 @@ export default function App() {
   const montoTotal = filas.reduce((s, f) => s + f.monto, 0);
 
   const vActivo = local.vendedores.find((v) => v.id === vendedorActivo) || local.vendedores[0];
+
+  const fechaDiaVista = fechaSeleccionada || hoyComoFecha();
+  const diasGrilla = vista === "semana"
+    ? diasDeLaSemana(semanaInicio)
+    : [new Date(fechaDiaVista.year, fechaDiaVista.month - 1, fechaDiaVista.day)];
 
   return (
     <div className="vdhApp" data-theme={tema} style={S.page}>
@@ -683,8 +794,11 @@ export default function App() {
         </div>
       </div>
 
-      {/* Navegador de mes */}
-      <MonthNav year={year} month={month} onPrev={() => cambiarMes(-1)} onNext={() => cambiarMes(1)} onHoy={irAHoy} />
+      {/* Navegador de mes/semana/día */}
+      <ViewNav
+        vista={vista} mesVista={mesVista} semanaInicio={semanaInicio} fechaSeleccionada={fechaDiaVista}
+        onPrev={navPrev} onNext={navNext} onHoy={irAHoy}
+      />
 
       <div className="appGrid">
         {/* Columna izquierda: configuración y edición */}
@@ -801,6 +915,7 @@ export default function App() {
                 onChange={(patch) => updateVendedor(vActivo.id, patch)}
                 onCopiarMesAnterior={() => copiarMesAnteriorVendedor(vActivo)}
                 onRepetirSemana={() => repetirSemanaVendedor(vActivo)}
+                onCopiarSemanaAnterior={() => copiarSemanaAnteriorVendedor(vActivo)}
                 onRemove={() => removeVendedor(vActivo.id)}
                 canRemove={local.vendedores.length > 1}
                 horasCalc={horasDeVendedor(vActivo)}
@@ -812,16 +927,38 @@ export default function App() {
         {/* Columna central: calendario, grande */}
         <div className="card-calendario">
           <div style={S.card}>
-            <div style={S.sectionTitle}>Calendario de horarios</div>
-            <div style={S.miniStat}>Tocá un día para cargar el horario del vendedor seleccionado</div>
+            <div style={S.rowBetween}>
+              <div>
+                <div style={S.sectionTitle}>Calendario de horarios</div>
+                <div style={S.miniStat}>
+                  {vista === "mes" ? "Tocá un día para cargar el horario del vendedor seleccionado" : "Tocá un turno para editarlo, o el espacio vacío para elegir el día"}
+                </div>
+              </div>
+              <div style={S.vistaSwitchRow}>
+                <button onClick={() => cambiarVista("mes")} style={vista === "mes" ? S.vistaBtnActive : S.vistaBtn}>Mes</button>
+                <button onClick={() => cambiarVista("semana")} style={vista === "semana" ? S.vistaBtnActive : S.vistaBtn}>Semana</button>
+                <button onClick={() => cambiarVista("dia")} style={vista === "dia" ? S.vistaBtnActive : S.vistaBtn}>Día</button>
+              </div>
+            </div>
             <div style={{ marginTop: 10 }}>
-              <SharedCalendar
-                year={year} month={month} nDias={nDias} leadBlanks={leadBlanks} prefix={prefix}
-                vendedores={local.vendedores}
-                local={local}
-                diaSeleccionado={diaSeleccionado}
-                onSelectDia={setDiaSeleccionado}
-              />
+              {vista === "mes" ? (
+                <SharedCalendar
+                  year={year} month={month} nDias={nDias} leadBlanks={leadBlanks} prefix={prefix}
+                  vendedores={local.vendedores}
+                  local={local}
+                  fechaSeleccionada={fechaSeleccionada}
+                  onSelectFecha={setFechaSeleccionada}
+                />
+              ) : (
+                <GrillaSemana
+                  dias={diasGrilla}
+                  vendedores={local.vendedores}
+                  local={local}
+                  fechaSeleccionada={fechaSeleccionada}
+                  onSelectFecha={setFechaSeleccionada}
+                  onSelectVendedor={setVendedorActivo}
+                />
+              )}
             </div>
             <div style={S.legendRow}>
               {local.vendedores.map((v) => (
@@ -848,11 +985,10 @@ export default function App() {
             vendedor={vActivo}
             vendedores={local.vendedores}
             local={local}
-            year={year} month={month} nDias={nDias}
-            diaSeleccionado={diaSeleccionado}
-            onCambiarDia={setDiaSeleccionado}
-            onSetTurnos={(d, turnos) => setTurnosDia(vActivo, d, turnos)}
-            onQuitarDia={(d) => quitarDiaVendedor(vActivo, d)}
+            fecha={fechaSeleccionada}
+            onCambiarFecha={setFechaSeleccionada}
+            onSetTurnos={(turnos) => setTurnosDia(vActivo, fechaSeleccionada, turnos)}
+            onQuitarDia={() => quitarDiaVendedor(vActivo, fechaSeleccionada)}
           />
 
           <div style={S.card}>
@@ -903,11 +1039,15 @@ export default function App() {
   );
 }
 
-function MonthNav({ year, month, onPrev, onNext, onHoy }) {
+function ViewNav({ vista, mesVista, semanaInicio, fechaSeleccionada, onPrev, onNext, onHoy }) {
+  let label;
+  if (vista === "mes") label = `${MESES[mesVista.month - 1]} ${mesVista.year}`;
+  else if (vista === "semana") label = fmtRangoSemana(semanaInicio);
+  else label = fmtFechaLarga(fechaSeleccionada);
   return (
     <div style={S.monthNav}>
       <button onClick={onPrev} style={S.navBtn}><ChevronLeft size={16} /></button>
-      <span style={S.monthLabel}>{MESES[month - 1]} {year}</span>
+      <span style={S.monthLabel}>{label}</span>
       <button onClick={onNext} style={S.navBtn}><ChevronRight size={16} /></button>
       <button onClick={onHoy} style={S.hoyBtn}>Hoy</button>
     </div>
@@ -932,10 +1072,10 @@ function FeriadoPicker({ onAgregar }) {
   );
 }
 
-// Calendario que muestra, para TODOS los vendedores del local, los turnos cargados
-// cada día (como un calendario compartido tipo Google Calendar, con color por vendedor).
-// Marca el día actual, los días cerrados (fijos o feriados) y los huecos de cobertura.
-function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, local, diaSeleccionado, onSelectDia }) {
+// Calendario mensual: para TODOS los vendedores del local, un resumen compacto de los turnos
+// cargados cada día (nombre + horario, con una tira fina proporcional al horario del local
+// debajo). Marca el día actual, los días cerrados (fijos o feriados) y los huecos de cobertura.
+function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, local, fechaSeleccionada, onSelectFecha }) {
   const feriados = feriadosArgentina(year);
   const desdeMin = minutosDe(local.horaInicio);
   const rango = Math.max(1, minutosDe(local.horaFin) - desdeMin);
@@ -951,7 +1091,7 @@ function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, lo
       .filter((x) => x.dia && x.dia.turnos && x.dia.turnos.length > 0);
     const visibles = entradas.slice(0, 4);
     const resto = entradas.length - visibles.length;
-    const seleccionado = diaSeleccionado === d;
+    const seleccionado = !!fechaSeleccionada && fechaSeleccionada.year === year && fechaSeleccionada.month === month && fechaSeleccionada.day === d;
     const hoy = esHoy(year, month, d);
     const tieneHueco = !cerrado && huecosDelDia(vendedores, key, local.horaInicio, local.horaFin).length > 0;
 
@@ -961,7 +1101,7 @@ function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, lo
     else if (hoy) cellStyle = S.dayCellHoy;
 
     cells.push(
-      <button key={d} onClick={() => onSelectDia(d)} style={cellStyle} title={feriado || undefined}>
+      <button key={d} onClick={() => onSelectFecha({ year, month, day: d })} style={cellStyle} title={feriado || undefined}>
         <span style={cerrado ? S.dayNumRowCerrado : hoy ? S.dayNumRowHoy : S.dayNumRow}>
           {d}
           {feriado && <span style={S.feriadoDot} />}
@@ -1000,7 +1140,120 @@ function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, lo
   );
 }
 
-function VendedorEditor({ v, prefix, onChange, onCopiarMesAnterior, onRepetirSemana, onRemove, canRemove, horasCalc }) {
+// Vista semana/día: grilla horaria estilo Google Calendar. Cada turno se dibuja en su posición
+// y duración reales; si varios vendedores se solapan, se acomodan en columnas lado a lado.
+function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFecha, onSelectVendedor }) {
+  const feriadosPorAnio = {};
+  const getFeriados = (y) => feriadosPorAnio[y] || (feriadosPorAnio[y] = feriadosArgentina(y));
+
+  const desdeMin = minutosDe(local.horaInicio);
+  const hastaMin = minutosDe(local.horaFin);
+  const rango = Math.max(60, hastaMin - desdeMin);
+  const PX_POR_HORA = 56;
+  const alturaTotal = (rango / 60) * PX_POR_HORA;
+
+  const horas = [];
+  for (let m = Math.ceil(desdeMin / 60) * 60; m <= hastaMin; m += 60) horas.push(m);
+
+  const anchoMin = dias.length * 108 + 46;
+
+  return (
+    <div style={S.semanaScroll}>
+      <div style={{ minWidth: anchoMin }}>
+        <div style={{ display: "flex" }}>
+          <div style={S.semanaAxisSpacer} />
+          <div style={{ display: "grid", gridTemplateColumns: `repeat(${dias.length}, 1fr)`, flex: 1, gap: 2 }}>
+            {dias.map((fecha, i) => {
+              const y = fecha.getFullYear(), m = fecha.getMonth() + 1, d = fecha.getDate();
+              const key = dateKey(y, m, d);
+              const hoy = esHoy(y, m, d);
+              const sel = !!fechaSeleccionada && fechaSeleccionada.year === y && fechaSeleccionada.month === m && fechaSeleccionada.day === d;
+              const feriado = getFeriados(y)[key];
+              let estilo = S.semanaDiaHeader;
+              if (sel) estilo = S.semanaDiaHeaderSel;
+              else if (hoy) estilo = S.semanaDiaHeaderHoy;
+              return (
+                <button key={i} onClick={() => onSelectFecha({ year: y, month: m, day: d })} style={estilo} title={feriado || undefined}>
+                  <span style={S.semanaDiaHeaderNombre}>{DIAS_SEMANA_LARGO[fecha.getDay()].slice(0, 3)}</span>
+                  <span style={S.semanaDiaHeaderNum}>{d}{feriado && <span style={S.feriadoDot} />}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div style={{ display: "flex", marginTop: 6 }}>
+          <div style={{ ...S.semanaAxis, height: alturaTotal }}>
+            {horas.map((m) => (
+              <div key={m} style={{ ...S.semanaHoraLabel, top: ((m - desdeMin) / rango) * alturaTotal }}>
+                {minAHHMM(m)}
+              </div>
+            ))}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: `repeat(${dias.length}, 1fr)`, flex: 1, gap: 2, position: "relative" }}>
+            {dias.map((fecha, i) => {
+              const y = fecha.getFullYear(), m = fecha.getMonth() + 1, d = fecha.getDate();
+              const key = dateKey(y, m, d);
+              const cerrado = estaCerrado(local, y, m, d);
+              const eventos = [];
+              vendedores.filter((v) => v.modo === "calendario").forEach((v) => {
+                (v.dias[key]?.turnos || []).forEach((t, idx) => {
+                  eventos.push({
+                    vId: v.id, nombre: v.nombre, color: v.color, idx,
+                    inicioMin: minutosDe(t.inicio), finMin: minutosDe(t.fin),
+                  });
+                });
+              });
+              const dispuestos = disponerEventos(eventos);
+              const ahora = new Date();
+              const esHoyCol = ahora.getFullYear() === y && ahora.getMonth() + 1 === m && ahora.getDate() === d;
+              const minAhora = ahora.getHours() * 60 + ahora.getMinutes();
+              const mostrarAhora = esHoyCol && minAhora >= desdeMin && minAhora <= hastaMin;
+
+              return (
+                <div
+                  key={i}
+                  style={{ ...S.semanaDiaCol, height: alturaTotal, ...(cerrado ? S.semanaDiaColCerrado : {}) }}
+                  onClick={() => onSelectFecha({ year: y, month: m, day: d })}
+                >
+                  {horas.map((hm) => (
+                    <div key={hm} style={{ ...S.semanaGridLine, top: ((hm - desdeMin) / rango) * alturaTotal }} />
+                  ))}
+                  {mostrarAhora && (
+                    <div style={{ ...S.semanaAhora, top: ((minAhora - desdeMin) / rango) * alturaTotal }}>
+                      <span style={S.semanaAhoraDot} />
+                    </div>
+                  )}
+                  {dispuestos.map((ev) => {
+                    const top = ((ev.inicioMin - desdeMin) / rango) * alturaTotal;
+                    const alto = Math.max(20, ((ev.finMin - ev.inicioMin) / rango) * alturaTotal);
+                    const left = (ev.col / ev.totalCols) * 100;
+                    const ancho = 100 / ev.totalCols;
+                    return (
+                      <button
+                        key={ev.vId + "-" + ev.idx}
+                        onClick={(e) => { e.stopPropagation(); onSelectFecha({ year: y, month: m, day: d }); onSelectVendedor(ev.vId); }}
+                        style={{ ...S.semanaEvento, top, height: alto, left: `${left}%`, width: `calc(${ancho}% - 3px)`, background: ev.color }}
+                        title={`${ev.nombre || "Sin nombre"}: ${fmtHoraCorta(minAHHMM(ev.inicioMin))}-${fmtHoraCorta(minAHHMM(ev.finMin))}`}
+                      >
+                        <span style={S.semanaEventoNombre}>{ev.nombre || "Sin nombre"}</span>
+                        {alto >= 34 && (
+                          <span style={S.semanaEventoHora}>{fmtHoraCorta(minAHHMM(ev.inicioMin))}–{fmtHoraCorta(minAHHMM(ev.finMin))}</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function VendedorEditor({ v, prefix, onChange, onCopiarMesAnterior, onRepetirSemana, onCopiarSemanaAnterior, onRemove, canRemove, horasCalc }) {
   const diasMarcados = Object.keys(v.dias).filter((k) => k.startsWith(prefix)).length;
   const [msg, setMsg] = useState("");
 
@@ -1012,6 +1265,11 @@ function VendedorEditor({ v, prefix, onChange, onCopiarMesAnterior, onRepetirSem
   const handleRepetir = () => {
     const n = onRepetirSemana();
     setMsg(n > 0 ? `Se repitieron ${n} días según la primera semana` : "Cargá al menos un día en la primera semana (1 al 7) para repetir");
+    setTimeout(() => setMsg(""), 2500);
+  };
+  const handleCopiarSemana = () => {
+    const n = onCopiarSemanaAnterior();
+    setMsg(n > 0 ? `Se copiaron ${n} días de la semana anterior` : "No hay datos la semana anterior para copiar");
     setTimeout(() => setMsg(""), 2500);
   };
 
@@ -1046,6 +1304,7 @@ function VendedorEditor({ v, prefix, onChange, onCopiarMesAnterior, onRepetirSem
           <div style={S.rowBetween3}>
             <button onClick={handleCopiar} style={S.copyBtn}>Copiar mes anterior</button>
             <button onClick={handleRepetir} style={S.copyBtn}>Repetir 1ª semana</button>
+            <button onClick={handleCopiarSemana} style={S.copyBtn}>Copiar semana anterior</button>
           </div>
           {msg && <div style={S.copiadoMsg}>{msg}</div>}
         </>
@@ -1067,22 +1326,21 @@ function VendedorEditor({ v, prefix, onChange, onCopiarMesAnterior, onRepetirSem
   );
 }
 
-// Panel de edición del horario del vendedor seleccionado, para el día elegido en el calendario.
-// El aviso de huecos considera a TODOS los vendedores del local ese día, no solo al activo.
-function TurnoEditorCard({ vendedor, vendedores, local, year, month, nDias, diaSeleccionado, onCambiarDia, onSetTurnos, onQuitarDia }) {
+// Panel de edición del horario del vendedor seleccionado, para la fecha elegida en el calendario.
+// El aviso de huecos y el resumen del día consideran a TODOS los vendedores, no solo al activo.
+function TurnoEditorCard({ vendedor, vendedores, local, fecha, onCambiarFecha, onSetTurnos, onQuitarDia }) {
   if (!vendedor) return null;
 
   const cambiarDia = (delta) => {
-    if (!diaSeleccionado) return;
-    const nuevo = diaSeleccionado + delta;
-    if (nuevo < 1 || nuevo > nDias) return;
-    onCambiarDia(nuevo);
+    const base = fecha || hoyComoFecha();
+    const d = sumarDias(new Date(base.year, base.month - 1, base.day), delta);
+    onCambiarFecha({ year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate() });
   };
 
-  const cerrado = diaSeleccionado ? estaCerrado(local, year, month, diaSeleccionado) : false;
-  const feriado = diaSeleccionado ? feriadosArgentina(year)[dateKey(year, month, diaSeleccionado)] : null;
-  const huecos = diaSeleccionado && !cerrado
-    ? huecosDelDia(vendedores, dateKey(year, month, diaSeleccionado), local.horaInicio, local.horaFin)
+  const cerrado = fecha ? estaCerrado(local, fecha.year, fecha.month, fecha.day) : false;
+  const feriado = fecha ? feriadosArgentina(fecha.year)[dateKey(fecha.year, fecha.month, fecha.day)] : null;
+  const huecos = fecha && !cerrado
+    ? huecosDelDia(vendedores, dateKey(fecha.year, fecha.month, fecha.day), local.horaInicio, local.horaFin)
     : [];
 
   return (
@@ -1093,19 +1351,19 @@ function TurnoEditorCard({ vendedor, vendedores, local, year, month, nDias, diaS
           <span style={{ ...S.legendDot, background: vendedor.color }} />
           <span>{vendedor.nombre || "Sin nombre"}</span>
         </div>
-        {diaSeleccionado && (
+        {fecha && (
           <div style={S.dayNavRow}>
             <button onClick={() => cambiarDia(-1)} style={S.navBtnSm}><ChevronLeft size={13} /></button>
-            <span style={S.dayNavLabel}>{diaSeleccionado} de {MESES[month - 1].slice(0, 3)}</span>
+            <span style={S.dayNavLabel}>{fecha.day} de {MESES[fecha.month - 1].slice(0, 3)}</span>
             <button onClick={() => cambiarDia(1)} style={S.navBtnSm}><ChevronRight size={13} /></button>
           </div>
         )}
       </div>
 
-      {diaSeleccionado && (
+      {fecha && (
         <div style={S.diaResumenBlock}>
           {vendedores.filter((v) => v.modo === "calendario").map((v) => {
-            const dia = v.dias[dateKey(year, month, diaSeleccionado)];
+            const dia = v.dias[dateKey(fecha.year, fecha.month, fecha.day)];
             const turnos = dia?.turnos || [];
             return (
               <div key={v.id} style={S.diaResumenRow}>
@@ -1134,13 +1392,13 @@ function TurnoEditorCard({ vendedor, vendedores, local, year, month, nDias, diaS
 
       {vendedor.modo !== "calendario" ? (
         <div style={S.note}>Este vendedor usa "Patrón rápido" — su horario no se carga por calendario.</div>
-      ) : !diaSeleccionado ? (
+      ) : !fecha ? (
         <div style={S.notePlain}>Tocá un día en el calendario para cargar su horario.</div>
       ) : (
         <TurnoEditorDia
           vendedor={vendedor}
           local={local}
-          year={year} month={month} dia={diaSeleccionado}
+          fecha={fecha}
           onSetTurnos={onSetTurnos}
           onQuitarDia={onQuitarDia}
         />
@@ -1149,8 +1407,8 @@ function TurnoEditorCard({ vendedor, vendedores, local, year, month, nDias, diaS
   );
 }
 
-function TurnoEditorDia({ vendedor, local, year, month, dia, onSetTurnos, onQuitarDia }) {
-  const key = dateKey(year, month, dia);
+function TurnoEditorDia({ vendedor, local, fecha, onSetTurnos, onQuitarDia }) {
+  const key = dateKey(fecha.year, fecha.month, fecha.day);
   const turnos = vendedor.dias[key]?.turnos || [];
   const opciones = generarOpcionesHora(local.horaInicio, local.horaFin);
   const opcionesInicio = opciones.length > 1 ? opciones.slice(0, -1) : opciones;
@@ -1169,16 +1427,16 @@ function TurnoEditorDia({ vendedor, local, year, month, dia, onSetTurnos, onQuit
       }
       return { ...t, fin: valor };
     });
-    onSetTurnos(dia, nuevos);
+    onSetTurnos(nuevos);
   };
   const agregarBloque = () => {
     if (turnos.length >= 2) return;
-    onSetTurnos(dia, [...turnos, nuevoTurnoDefault(local, turnos)]);
+    onSetTurnos([...turnos, nuevoTurnoDefault(local, turnos)]);
   };
   const quitarBloque = (idx) => {
     const nuevos = turnos.filter((_, i) => i !== idx);
-    if (nuevos.length === 0) onQuitarDia(dia);
-    else onSetTurnos(dia, nuevos);
+    if (nuevos.length === 0) onQuitarDia();
+    else onSetTurnos(nuevos);
   };
 
   return (
@@ -1246,7 +1504,6 @@ const S = {
     boxShadow: "0 1px 2px rgba(0,0,0,0.04), 0 8px 20px -12px rgba(0,0,0,0.08)",
     display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap",
   },
-  headerTop: { display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" },
   headerRight: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 },
   headerRightRow: { display: "flex", alignItems: "center", gap: 8 },
   logoRow: { display: "flex", alignItems: "center", gap: 7 },
@@ -1336,7 +1593,7 @@ const S = {
     borderRadius: 8, padding: "7px 10px", cursor: "pointer",
   },
   miniStat: { fontSize: 11.5, color: SUB, fontWeight: 600, marginTop: 4 },
-  monthNav: { display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 10 },
+  monthNav: { display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" },
   navBtn: {
     width: 28, height: 28, borderRadius: 999, border: `1px solid ${LINE}`, background: SURFACE_INPUT,
     color: INK, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer",
@@ -1350,6 +1607,15 @@ const S = {
     borderRadius: 999, padding: "6px 13px", cursor: "pointer", marginLeft: 4,
   },
   monthLabel: { fontSize: 14, fontWeight: 700, minWidth: 120, textAlign: "center", color: INK },
+  vistaSwitchRow: { display: "flex", gap: 4, flexShrink: 0 },
+  vistaBtn: {
+    fontSize: 11.5, fontWeight: 700, color: SUB, background: SURFACE_2, border: "none",
+    borderRadius: 8, padding: "6px 10px", cursor: "pointer",
+  },
+  vistaBtnActive: {
+    fontSize: 11.5, fontWeight: 700, color: "#fff", background: ACCENT, border: "none",
+    borderRadius: 8, padding: "6px 10px", cursor: "pointer",
+  },
   weekHeader: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", marginBottom: 4 },
   weekHeaderCell: { fontSize: 10.5, color: SUB, fontWeight: 700, textAlign: "center" },
   grid: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 5 },
@@ -1471,6 +1737,41 @@ const S = {
     width: 16, height: 16, borderRadius: 99, border: "none", background: "transparent", color: SUB,
     fontSize: 13, lineHeight: 1, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
   },
+  semanaScroll: { overflowX: "auto", WebkitOverflowScrolling: "touch" },
+  semanaAxisSpacer: { width: 42, flexShrink: 0 },
+  semanaAxis: { width: 42, flexShrink: 0, position: "relative" },
+  semanaHoraLabel: {
+    position: "absolute", right: 6, transform: "translateY(-50%)",
+    fontSize: 9.5, color: SUB, fontWeight: 600, whiteSpace: "nowrap",
+  },
+  semanaDiaHeader: {
+    display: "flex", flexDirection: "column", alignItems: "center", gap: 2, padding: "4px 2px",
+    borderRadius: 8, border: "none", background: "transparent", cursor: "pointer",
+  },
+  semanaDiaHeaderHoy: {
+    display: "flex", flexDirection: "column", alignItems: "center", gap: 2, padding: "4px 2px",
+    borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: ACCENT,
+  },
+  semanaDiaHeaderSel: {
+    display: "flex", flexDirection: "column", alignItems: "center", gap: 2, padding: "4px 2px",
+    borderRadius: 8, border: `1px solid ${ACCENT}`, background: ACCENT_SOFT, cursor: "pointer",
+  },
+  semanaDiaHeaderNombre: { fontSize: 10, fontWeight: 700, color: SUB, textTransform: "uppercase" },
+  semanaDiaHeaderNum: { fontSize: 14, fontWeight: 800, color: INK, display: "flex", alignItems: "center", gap: 3 },
+  semanaDiaCol: { position: "relative", borderLeft: `1px solid ${LINE}`, cursor: "pointer" },
+  semanaDiaColCerrado: {
+    background: `repeating-linear-gradient(135deg, ${SURFACE_2}, ${SURFACE_2} 6px, transparent 6px, transparent 12px)`,
+  },
+  semanaGridLine: { position: "absolute", left: 0, right: 0, borderTop: `1px solid ${LINE}`, pointerEvents: "none" },
+  semanaAhora: { position: "absolute", left: 0, right: 0, height: 2, background: "#E0524A", zIndex: 5, pointerEvents: "none" },
+  semanaAhoraDot: { position: "absolute", left: -3, top: -3, width: 8, height: 8, borderRadius: 99, background: "#E0524A" },
+  semanaEvento: {
+    position: "absolute", borderRadius: 6, padding: "3px 6px", color: "#fff", border: "none",
+    cursor: "pointer", overflow: "hidden", textAlign: "left", display: "flex", flexDirection: "column",
+    boxSizing: "border-box",
+  },
+  semanaEventoNombre: { fontSize: 10.5, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  semanaEventoHora: { fontSize: 9, fontWeight: 600, opacity: 0.9 },
 };
 
 const CSS = `
