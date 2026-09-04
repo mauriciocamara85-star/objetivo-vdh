@@ -969,15 +969,21 @@ function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, lo
         </span>
         {cerrado && visibles.length === 0 && <span style={S.cerradoLabel}>Cerrado</span>}
         {!cerrado && feriado && visibles.length === 0 && <span style={S.feriadoLabel}>{feriado}</span>}
-        {visibles.map(({ v, dia }) => (
-          <div key={v.id} style={S.turnoTrack} title={`${v.nombre || "Sin nombre"}: ${fmtResumenDia(dia)}`}>
-            {dia.turnos.map((t, i) => {
-              const left = Math.max(0, Math.min(100, ((minutosDe(t.inicio) - desdeMin) / rango) * 100));
-              const ancho = Math.max(4, Math.min(100 - left, (duracionTurno(t) * 60 / rango) * 100));
-              return <span key={i} style={{ ...S.turnoSegment, left: `${left}%`, width: `${ancho}%`, background: v.color }} />;
-            })}
-          </div>
-        ))}
+        {visibles.map(({ v, dia }) => {
+          const primerNombre = (v.nombre || "Sin nombre").split(" ")[0];
+          return (
+            <div key={v.id} style={S.turnoRowCal} title={`${v.nombre || "Sin nombre"}: ${fmtResumenDia(dia)}`}>
+              <div style={S.turnoTrack}>
+                {dia.turnos.map((t, i) => {
+                  const left = Math.max(0, Math.min(100, ((minutosDe(t.inicio) - desdeMin) / rango) * 100));
+                  const ancho = Math.max(4, Math.min(100 - left, (duracionTurno(t) * 60 / rango) * 100));
+                  return <span key={i} style={{ ...S.turnoSegment, left: `${left}%`, width: `${ancho}%`, background: v.color }} />;
+                })}
+              </div>
+              <span style={{ ...S.turnoTextLabel, color: v.color }}>{primerNombre} {fmtResumenDia(dia)}</span>
+            </div>
+          );
+        })}
         {resto > 0 && <span style={S.moreBadge}>+{resto} más</span>}
       </button>
     );
@@ -1231,7 +1237,7 @@ const S = {
   page: {
     minHeight: "100vh", background: BG, color: INK,
     fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif",
-    padding: "24px 20px 48px", maxWidth: 1400, margin: "0 auto",
+    padding: "24px 20px 48px", maxWidth: 1460, margin: "0 auto",
   },
   loadingWrap: { minHeight: "100vh", background: BG, display: "flex", alignItems: "center", justifyContent: "center" },
   loadingDot: { width: 10, height: 10, borderRadius: 99, background: ACCENT, animation: "pulse 1s infinite ease-in-out" },
@@ -1348,22 +1354,22 @@ const S = {
   weekHeaderCell: { fontSize: 10.5, color: SUB, fontWeight: 700, textAlign: "center" },
   grid: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 5 },
   dayCell: {
-    minHeight: 82, border: "none", borderRadius: 10, background: SURFACE_2, color: INK,
+    minHeight: 100, border: "none", borderRadius: 10, background: SURFACE_2, color: INK,
     cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "stretch",
     justifyContent: "flex-start", padding: "5px 4px", gap: 3, textAlign: "left", boxSizing: "border-box",
   },
   dayCellSelected: {
-    minHeight: 82, border: `1.5px solid ${ACCENT}`, borderRadius: 10, background: ACCENT_SOFT, color: INK,
+    minHeight: 100, border: `1.5px solid ${ACCENT}`, borderRadius: 10, background: ACCENT_SOFT, color: INK,
     cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "stretch",
     justifyContent: "flex-start", padding: "4.5px 3.5px", gap: 3, textAlign: "left", boxSizing: "border-box",
   },
   dayCellHoy: {
-    minHeight: 82, border: `1.5px solid ${ACCENT}`, borderRadius: 10, background: SURFACE_2, color: INK,
+    minHeight: 100, border: `1.5px solid ${ACCENT}`, borderRadius: 10, background: SURFACE_2, color: INK,
     cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "stretch",
     justifyContent: "flex-start", padding: "4.5px 3.5px", gap: 3, textAlign: "left", boxSizing: "border-box",
   },
   dayCellCerrado: {
-    minHeight: 82, border: "none", borderRadius: 10, color: SUB,
+    minHeight: 100, border: "none", borderRadius: 10, color: SUB,
     background: `repeating-linear-gradient(135deg, ${SURFACE_2}, ${SURFACE_2} 6px, transparent 6px, transparent 12px), ${CARD}`,
     cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "stretch",
     justifyContent: "flex-start", padding: "5px 4px", gap: 3, textAlign: "left", boxSizing: "border-box",
@@ -1374,8 +1380,13 @@ const S = {
   cerradoLabel: { fontSize: 8.5, fontWeight: 700, color: SUB, padding: "0 2px" },
   feriadoDot: { width: 5, height: 5, borderRadius: 99, background: "var(--feriado)", flexShrink: 0, display: "inline-block" },
   feriadoLabel: { fontSize: 8.5, fontWeight: 700, color: "var(--feriado)", padding: "0 2px" },
-  turnoTrack: { position: "relative", width: "100%", height: 8, flexShrink: 0 },
-  turnoSegment: { position: "absolute", top: 0, bottom: 0, borderRadius: 3 },
+  turnoRowCal: { display: "flex", flexDirection: "column", gap: 1, width: "100%", flexShrink: 0 },
+  turnoTrack: { position: "relative", width: "100%", height: 3, flexShrink: 0 },
+  turnoSegment: { position: "absolute", top: 0, bottom: 0, borderRadius: 2 },
+  turnoTextLabel: {
+    fontSize: 8.5, fontWeight: 700, lineHeight: 1.2,
+    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+  },
   moreBadge: { fontSize: 8, fontWeight: 700, color: SUB, padding: "0 3px" },
   gapDot: { width: 5, height: 5, borderRadius: 99, background: WARN, flexShrink: 0, display: "inline-block" },
   gapWarning: {
@@ -1508,7 +1519,7 @@ const CSS = `
   @media (min-width: 900px) {
     .appGrid {
       display: grid;
-      grid-template-columns: 300px minmax(0, 1fr) 320px;
+      grid-template-columns: 280px minmax(0, 1fr) 300px;
       grid-template-areas:
         "local calendario derecha"
         "vendedores calendario derecha";
