@@ -846,7 +846,7 @@ function App() {
 
       <div className="appGrid">
         {/* Columna izquierda: configuración y edición */}
-        <div className="card-local">
+        <div className="card-izquierda">
           <div style={S.card}>
             <div style={S.rowBetween}>
               <input
@@ -927,9 +927,7 @@ function App() {
               )}
             </div>
           </div>
-        </div>
 
-        <div className="card-vendedores">
           <div style={S.card}>
             <div style={S.rowBetween}>
               <div style={S.sectionTitle}>Vendedores</div>
@@ -1613,7 +1611,7 @@ const S = {
   },
   chipDot: { width: 7, height: 7, borderRadius: 99, flexShrink: 0, display: "inline-block" },
   card: {
-    background: CARD, borderRadius: 18, padding: 15, marginBottom: 12,
+    background: CARD, borderRadius: 18, padding: 15,
     boxShadow: "0 1px 2px rgba(0,0,0,0.04), 0 8px 20px -12px rgba(0,0,0,0.08)",
   },
   rowBetween: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 10 },
@@ -1873,28 +1871,19 @@ const CSS = `
   @keyframes pulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.6); opacity: 0.5; } }
 
   .appGrid { display: flex; flex-direction: column; gap: 12px; }
+  .card-izquierda, .card-derecha { display: flex; flex-direction: column; gap: 12px; }
 
   @media (min-width: 900px) {
     .appGrid {
       display: grid;
       grid-template-columns: 280px minmax(0, 1fr) 300px;
-      grid-template-areas:
-        "local calendario derecha"
-        "vendedores calendario derecha";
+      grid-template-areas: "izquierda calendario derecha";
       gap: 16px;
       align-items: start;
     }
-    .card-local { grid-area: local; }
-    .card-vendedores { grid-area: vendedores; }
+    .card-izquierda { grid-area: izquierda; position: sticky; top: 20px; }
     .card-calendario { grid-area: calendario; }
-    .card-derecha {
-      grid-area: derecha;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-      position: sticky;
-      top: 20px;
-    }
+    .card-derecha { grid-area: derecha; position: sticky; top: 20px; }
   }
 `;
 
