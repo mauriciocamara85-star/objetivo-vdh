@@ -669,33 +669,13 @@ function App() {
     <div className="vdhApp" data-theme={tema} style={S.page}>
       <style>{CSS}</style>
 
-      {/* Header */}
+      {/* Header: compacto, todo en una fila, para dejarle más lugar al calendario */}
       <div style={S.headerBand}>
-        <div style={S.headerTop}>
-          <div style={S.logoRow}>
-            <div style={S.logoMark}>VDH</div>
-            <div>
-              <div style={S.brandTitle}>Objetivo VDH</div>
-              <div style={S.brandSubtitle}>REPARTO POR VENDEDOR</div>
-            </div>
-          </div>
-          <div style={S.headerRight}>
-            <div style={S.headerRightRow}>
-              <span style={syncMode === "db" ? S.syncBadgeOn : S.syncBadgeOff}>
-                {syncMode === "db" ? "☁ Sincronizado" : "📱 Solo este dispositivo"}
-              </span>
-              <button
-                onClick={() => setTema((t) => (t === "dark" ? "light" : "dark"))}
-                style={S.temaBtn}
-                title={tema === "dark" ? "Cambiar a modo claro" : "Cambiar a modo oscuro"}
-              >
-                {tema === "dark" ? "☀️" : "🌙"}
-              </button>
-            </div>
-            <div style={{ ...S.savedPill, opacity: saved ? 1 : 0.001 }}>
-              <Check size={11} strokeWidth={3} />
-              <span>Guardado</span>
-            </div>
+        <div style={S.logoRow}>
+          <div style={S.logoMark}>VDH</div>
+          <div>
+            <div style={S.brandTitle}>Objetivo VDH</div>
+            <div style={S.brandSubtitle}>REPARTO POR VENDEDOR</div>
           </div>
         </div>
 
@@ -725,6 +705,25 @@ function App() {
               </button>
             </div>
           )}
+        </div>
+
+        <div style={S.headerRight}>
+          <div style={S.headerRightRow}>
+            <span style={syncMode === "db" ? S.syncBadgeOn : S.syncBadgeOff}>
+              {syncMode === "db" ? "☁ Sincronizado" : "📱 Solo este dispositivo"}
+            </span>
+            <button
+              onClick={() => setTema((t) => (t === "dark" ? "light" : "dark"))}
+              style={S.temaBtn}
+              title={tema === "dark" ? "Cambiar a modo claro" : "Cambiar a modo oscuro"}
+            >
+              {tema === "dark" ? "☀️" : "🌙"}
+            </button>
+          </div>
+          <div style={{ ...S.savedPill, opacity: saved ? 1 : 0.001 }}>
+            <Check size={11} strokeWidth={3} />
+            <span>Guardado</span>
+          </div>
         </div>
       </div>
 
@@ -982,6 +981,8 @@ function FeriadoPicker({ onAgregar }) {
 // Marca el día actual, los días cerrados (fijos o feriados) y los huecos de cobertura.
 function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, local, diaSeleccionado, onSelectDia }) {
   const feriados = feriadosArgentina(year);
+  const desdeMin = minutosDe(local.horaInicio);
+  const rango = Math.max(1, minutosDe(local.horaFin) - desdeMin);
   const cells = [];
   for (let i = 0; i < leadBlanks; i++) cells.push(<div key={"b" + i} />);
   for (let d = 1; d <= nDias; d++) {
@@ -1013,7 +1014,13 @@ function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, lo
         {cerrado && visibles.length === 0 && <span style={S.cerradoLabel}>Cerrado</span>}
         {!cerrado && feriado && visibles.length === 0 && <span style={S.feriadoLabel}>{feriado}</span>}
         {visibles.map(({ v, dia }) => (
-          <span key={v.id} style={{ ...S.turnoBar, background: v.color }}>{fmtResumenDia(dia)}</span>
+          <div key={v.id} style={S.turnoTrack} title={`${v.nombre || "Sin nombre"}: ${fmtResumenDia(dia)}`}>
+            {dia.turnos.map((t, i) => {
+              const left = Math.max(0, Math.min(100, ((minutosDe(t.inicio) - desdeMin) / rango) * 100));
+              const ancho = Math.max(4, Math.min(100 - left, (duracionTurno(t) * 60 / rango) * 100));
+              return <span key={i} style={{ ...S.turnoSegment, left: `${left}%`, width: `${ancho}%`, background: v.color }} />;
+            })}
+          </div>
         ))}
         {resto > 0 && <span style={S.moreBadge}>+{resto} más</span>}
       </button>
@@ -1132,6 +1139,22 @@ function TurnoEditorCard({ vendedor, vendedores, local, year, month, nDias, diaS
           </div>
         )}
       </div>
+
+      {diaSeleccionado && (
+        <div style={S.diaResumenBlock}>
+          {vendedores.filter((v) => v.modo === "calendario").map((v) => {
+            const dia = v.dias[dateKey(year, month, diaSeleccionado)];
+            const turnos = dia?.turnos || [];
+            return (
+              <div key={v.id} style={S.diaResumenRow}>
+                <span style={{ ...S.legendDot, background: v.color }} />
+                <span style={S.diaResumenNombre}>{v.nombre || "Sin nombre"}</span>
+                <span style={S.diaResumenHoras}>{turnos.length ? fmtResumenDia(dia) : "sin horario"}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {feriado && (
         <div style={S.notePlain}>📅 Feriado nacional: {feriado}</div>
@@ -1257,19 +1280,21 @@ const S = {
   loadingWrap: { minHeight: "100vh", background: BG, display: "flex", alignItems: "center", justifyContent: "center" },
   loadingDot: { width: 10, height: 10, borderRadius: 99, background: ACCENT, animation: "pulse 1s infinite ease-in-out" },
   headerBand: {
-    background: CARD, borderRadius: 18, padding: "14px 15px", marginBottom: 12,
+    background: CARD, borderRadius: 16, padding: "9px 12px", marginBottom: 10,
     boxShadow: "0 1px 2px rgba(0,0,0,0.04), 0 8px 20px -12px rgba(0,0,0,0.08)",
+    display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap",
   },
-  headerTop: { display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 12 },
-  headerRight: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3 },
+  headerTop: { display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" },
+  headerRight: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 },
   headerRightRow: { display: "flex", alignItems: "center", gap: 8 },
-  logoRow: { display: "flex", alignItems: "center", gap: 9 },
+  logoRow: { display: "flex", alignItems: "center", gap: 7 },
   logoMark: {
-    width: 34, height: 34, borderRadius: 9, background: ACCENT, color: "#fff",
-    display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 800, letterSpacing: "-0.02em",
+    width: 26, height: 26, borderRadius: 7, background: ACCENT, color: "#fff",
+    display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 800, letterSpacing: "-0.02em",
+    flexShrink: 0,
   },
-  brandTitle: { fontSize: 16, fontWeight: 800, letterSpacing: "-0.01em", lineHeight: 1.15, color: INK },
-  brandSubtitle: { fontSize: 9.5, fontWeight: 700, letterSpacing: "0.05em", color: SUB, marginTop: 1 },
+  brandTitle: { fontSize: 13.5, fontWeight: 800, letterSpacing: "-0.01em", lineHeight: 1.1, color: INK },
+  brandSubtitle: { fontSize: 8.5, fontWeight: 700, letterSpacing: "0.05em", color: SUB, marginTop: 0 },
   savedPill: {
     display: "flex", alignItems: "center", gap: 3, fontSize: 10.5, fontWeight: 700,
     color: GOOD, transition: "opacity 0.5s ease",
@@ -1280,10 +1305,10 @@ const S = {
     width: 22, height: 22, borderRadius: 999, border: "none", background: "transparent",
     fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
   },
-  localDropdownWrap: { position: "relative" },
+  localDropdownWrap: { position: "relative", flex: "1 1 220px", maxWidth: 340, minWidth: 160 },
   localDropdownBtn: {
     width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
-    background: BG, border: `1px solid ${LINE}`, borderRadius: 12, padding: "10px 12px",
+    background: BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: "7px 11px",
     cursor: "pointer",
   },
   localDropdownText: { fontSize: 13.5, fontWeight: 700, color: INK },
@@ -1393,10 +1418,8 @@ const S = {
   cerradoLabel: { fontSize: 8.5, fontWeight: 700, color: SUB, padding: "0 2px" },
   feriadoDot: { width: 5, height: 5, borderRadius: 99, background: "var(--feriado)", flexShrink: 0, display: "inline-block" },
   feriadoLabel: { fontSize: 8.5, fontWeight: 700, color: "var(--feriado)", padding: "0 2px" },
-  turnoBar: {
-    borderRadius: 4, padding: "1.5px 4px", fontSize: 8, fontWeight: 700, color: "#fff",
-    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", lineHeight: 1.5,
-  },
+  turnoTrack: { position: "relative", width: "100%", height: 8, flexShrink: 0 },
+  turnoSegment: { position: "absolute", top: 0, bottom: 0, borderRadius: 3 },
   moreBadge: { fontSize: 8, fontWeight: 700, color: SUB, padding: "0 3px" },
   gapDot: { width: 5, height: 5, borderRadius: 99, background: WARN, flexShrink: 0, display: "inline-block" },
   gapWarning: {
@@ -1425,6 +1448,13 @@ const S = {
   notePlain: { fontSize: 11.5, color: SUB, lineHeight: 1.4, marginBottom: 10 },
   eyebrowLine: { fontSize: 10.5, fontWeight: 700, color: SUB, marginBottom: 2 },
   turnoEditorTitle: { display: "flex", alignItems: "center", gap: 7, fontSize: 14, fontWeight: 700, color: INK },
+  diaResumenBlock: {
+    display: "flex", flexDirection: "column", gap: 5, background: SURFACE_2, borderRadius: 10,
+    padding: "8px 10px", marginBottom: 10,
+  },
+  diaResumenRow: { display: "flex", alignItems: "center", gap: 6, fontSize: 11.5 },
+  diaResumenNombre: { fontWeight: 700, color: INK, flexShrink: 0 },
+  diaResumenHoras: { color: SUB, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
   dayNavRow: { display: "flex", alignItems: "center", gap: 6 },
   dayNavLabel: { fontSize: 11.5, fontWeight: 700, color: INK, minWidth: 56, textAlign: "center" },
   turnoRow: { display: "flex", alignItems: "center", gap: 6, marginBottom: 8 },
@@ -1540,7 +1570,6 @@ const CSS = `
       position: sticky;
       top: 20px;
     }
-    .localDropdownOuter { max-width: 320px; }
   }
 `;
 
