@@ -760,19 +760,6 @@ export default function App() {
           </div>
         </div>
 
-        <div className="card-turno">
-          <TurnoEditorCard
-            vendedor={vActivo}
-            vendedores={local.vendedores}
-            local={local}
-            year={year} month={month} nDias={nDias}
-            diaSeleccionado={diaSeleccionado}
-            onCambiarDia={setDiaSeleccionado}
-            onSetTurnos={(d, turnos) => setTurnosDia(vActivo, d, turnos)}
-            onQuitarDia={(d) => quitarDiaVendedor(vActivo, d)}
-          />
-        </div>
-
         {/* Columna central: calendario, grande */}
         <div className="card-calendario">
           <div style={S.card}>
@@ -802,8 +789,19 @@ export default function App() {
           </div>
         </div>
 
-        {/* Columna derecha: reparto del mes */}
-        <div className="card-ranking">
+        {/* Columna derecha: horario del día seleccionado + reparto del mes */}
+        <div className="card-derecha">
+          <TurnoEditorCard
+            vendedor={vActivo}
+            vendedores={local.vendedores}
+            local={local}
+            year={year} month={month} nDias={nDias}
+            diaSeleccionado={diaSeleccionado}
+            onCambiarDia={setDiaSeleccionado}
+            onSetTurnos={(d, turnos) => setTurnosDia(vActivo, d, turnos)}
+            onQuitarDia={(d) => quitarDiaVendedor(vActivo, d)}
+          />
+
           <div style={S.card}>
             <div style={S.rowBetween}>
               <div>
@@ -1415,17 +1413,22 @@ const CSS = `
       display: grid;
       grid-template-columns: 300px minmax(0, 1fr) 320px;
       grid-template-areas:
-        "local calendario ranking"
-        "vendedores calendario ranking"
-        "turno calendario ranking";
+        "local calendario derecha"
+        "vendedores calendario derecha";
       gap: 16px;
       align-items: start;
     }
     .card-local { grid-area: local; }
     .card-vendedores { grid-area: vendedores; }
-    .card-turno { grid-area: turno; position: sticky; top: 20px; }
     .card-calendario { grid-area: calendario; }
-    .card-ranking { grid-area: ranking; position: sticky; top: 20px; }
+    .card-derecha {
+      grid-area: derecha;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      position: sticky;
+      top: 20px;
+    }
     .localDropdownOuter { max-width: 320px; }
   }
 `;
