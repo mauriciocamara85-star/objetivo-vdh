@@ -23,7 +23,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 
 <script type="text/babel" data-presets="react">
-const { useState, useEffect, useRef } = React;
+const { useState, useEffect, useLayoutEffect, useRef } = React;
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyAxCSmQ3bTMhH1PY4RVGPuO-HEfppnvw7A",
@@ -77,8 +77,10 @@ const MESES_CORTO = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct"
 
 // Paleta prolija y fija para identificar vendedores en el calendario compartido.
 // Se asigna en orden a medida que se agregan vendedores (no es elegible a mano).
+// El teal queda último a propósito: es el mismo color que el acento de toda la interfaz
+// (botones activos, "Hoy", "Guardado"), así que se reserva como último recurso para que un
+// vendedor no termine con turnos del mismo color que los resaltados de la app.
 const PALETA_VENDEDORES = [
-  "#2C6E71", // teal (acento)
   "#A97A66", // terracota
   "#6C7BA0", // azul grisáceo
   "#B08D3E", // mostaza
@@ -88,7 +90,9 @@ const PALETA_VENDEDORES = [
   "#B0654F", // ladrillo
   "#7A8C4C", // oliva
   "#5F6C8C", // índigo suave
+  "#2C6E71", // teal (acento) — reservado, último recurso
 ];
+const COLOR_RESERVADO_ACENTO = PALETA_VENDEDORES[PALETA_VENDEDORES.length - 1];
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 const pad2 = (n) => String(n).padStart(2, "0");
@@ -310,6 +314,36 @@ function defaultVendedor(nombre, colorIndex) {
   };
 }
 
+// Índice de paleta más bajo que ningún vendedor del local esté usando todavía. Antes se elegía
+// por la posición (vendedores.length) al momento de agregar, así que borrar un vendedor del medio
+// y agregar uno nuevo podía repetir el color de otro que ya estaba (p.ej. dos vendedores en mostaza).
+function indiceColorLibre(vendedoresActuales) {
+  const usados = new Set(vendedoresActuales.map((v) => v.color));
+  usados.add(COLOR_RESERVADO_ACENTO); // solo se entrega si ya no queda ningún otro color libre
+  for (let i = 0; i < PALETA_VENDEDORES.length; i++) {
+    if (!usados.has(PALETA_VENDEDORES[i])) return i;
+  }
+  return vendedoresActuales.length; // paleta agotada (11º+ vendedor): ahí sí se repite un color
+}
+
+// Repara datos ya guardados donde dos vendedores del mismo local quedaron con el mismo color
+// por el bug de arriba: al primero que aparece lo deja como está, al que choca le da el
+// siguiente color libre de la paleta. También le saca el color reservado (el del acento de la
+// interfaz) a cualquier vendedor que lo tenga, salvo que ya no quede ningún otro disponible.
+function dedupeColoresVendedores(vendedores) {
+  const usados = new Set([COLOR_RESERVADO_ACENTO]);
+  return vendedores.map((v) => {
+    if (v.color !== COLOR_RESERVADO_ACENTO && !usados.has(v.color)) {
+      usados.add(v.color);
+      return v;
+    }
+    const libre = PALETA_VENDEDORES.find((c) => !usados.has(c));
+    if (!libre) return v; // no queda ningún color libre: se deja como está
+    usados.add(libre);
+    return { ...v, color: libre };
+  });
+}
+
 function defaultLocal(nombre) {
   return {
     id: uid(),
@@ -343,11 +377,13 @@ function migrarDatos(parsed) {
       horaFin: l.horaFin || "22:00",
       diasCerrados: l.diasCerrados || [],
       fechasCerradas: l.fechasCerradas || [],
-      vendedores: l.vendedores.map((v, idx) => ({
-        ...v,
-        color: v.color || PALETA_VENDEDORES[idx % PALETA_VENDEDORES.length],
-        dias: yaEsV2 ? v.dias || {} : {},
-      })),
+      vendedores: dedupeColoresVendedores(
+        l.vendedores.map((v, idx) => ({
+          ...v,
+          color: v.color || PALETA_VENDEDORES[idx % PALETA_VENDEDORES.length],
+          dias: yaEsV2 ? v.dias || {} : {},
+        }))
+      ),
     };
   });
   return { ...parsed, locales, version: DATA_VERSION };
@@ -573,7 +609,7 @@ function App() {
   };
 
   const addVendedor = () => {
-    const nv = defaultVendedor("", local.vendedores.length);
+    const nv = defaultVendedor("", indiceColorLibre(local.vendedores));
     updateLocal({ vendedores: [...local.vendedores, nv] });
     setVendedorActivo(nv.id);
   };
@@ -1186,18 +1222,44 @@ function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFech
   const desdeMin = minutosDe(local.horaInicio);
   const hastaMin = minutosDe(local.horaFin);
   const rango = Math.max(60, hastaMin - desdeMin);
-  const PX_POR_HORA = 56;
-  const alturaTotal = (rango / 60) * PX_POR_HORA;
+
+  // La altura por hora se achica para que, siempre que entre, el horario completo del local se
+  // vea sin scroll vertical (antes era fija en 56px/hora y en locales con muchas horas de
+  // apertura la parte de abajo quedaba tapada). Si ni achicando entra —pantallas muy bajas—, el
+  // encabezado de días queda fijo arriba y solo hace scroll la grilla de turnos.
+  const scrollRef = useRef(null);
+  const [pxPorHora, setPxPorHora] = useState(56);
+  // Por debajo de los 900px el layout pasa a una sola columna (ver el media query del CSS de
+  // más abajo): ahí conviene un ancho mínimo por día con scroll horizontal, para que los turnos
+  // no queden ilegibles. Por encima de los 900px dejamos que los días se repartan todo el ancho
+  // disponible sin forzar un mínimo, para que la semana completa entre siempre (antes, con un
+  // mínimo fijo de 108px por día, el domingo podía quedar cortado por scroll horizontal apenas
+  // el panel del calendario no tuviera esos ~800px libres).
+  const [colAngosta, setColAngosta] = useState(false);
+  useLayoutEffect(() => {
+    function ajustar() {
+      const el = scrollRef.current;
+      if (!el) return;
+      const espacioDisponible = window.innerHeight - el.getBoundingClientRect().top - 90;
+      const horasDeRango = rango / 60;
+      setPxPorHora(Math.max(30, Math.min(56, Math.floor(espacioDisponible / horasDeRango))));
+      setColAngosta(window.innerWidth < 900);
+    }
+    ajustar();
+    window.addEventListener("resize", ajustar);
+    return () => window.removeEventListener("resize", ajustar);
+  }, [rango]);
+  const alturaTotal = (rango / 60) * pxPorHora;
 
   const horas = [];
   for (let m = Math.ceil(desdeMin / 60) * 60; m <= hastaMin; m += 60) horas.push(m);
 
-  const anchoMin = dias.length * 108 + 46;
+  const anchoMin = colAngosta ? dias.length * 108 + 46 : undefined;
 
   return (
-    <div style={S.semanaScroll}>
+    <div ref={scrollRef} style={{ ...S.semanaScroll, maxHeight: "calc(100vh - 160px)", overflowY: "auto" }}>
       <div style={{ minWidth: anchoMin }}>
-        <div style={{ display: "flex" }}>
+        <div style={{ display: "flex", position: "sticky", top: 0, zIndex: 2, background: CARD, paddingBottom: 2 }}>
           <div style={S.semanaAxisSpacer} />
           <div style={{ display: "grid", gridTemplateColumns: `repeat(${dias.length}, 1fr)`, flex: 1, gap: 2 }}>
             {dias.map((fecha, i) => {
@@ -1262,8 +1324,11 @@ function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFech
                     </div>
                   )}
                   {dispuestos.map((ev) => {
-                    const top = ((ev.inicioMin - desdeMin) / rango) * alturaTotal;
-                    const alto = Math.max(20, ((ev.finMin - ev.inicioMin) / rango) * alturaTotal);
+                    // Se recorta 1px arriba y abajo (igual que el "- 3px" del ancho, para las
+                    // columnas lado a lado) para que se note un corte entre dos turnos seguidos
+                    // del mismo día en vez de que los bloques queden pegados sin separación.
+                    const top = ((ev.inicioMin - desdeMin) / rango) * alturaTotal + 1;
+                    const alto = Math.max(20, ((ev.finMin - ev.inicioMin) / rango) * alturaTotal - 2);
                     const left = (ev.col / ev.totalCols) * 100;
                     const ancho = 100 / ev.totalCols;
                     return (
