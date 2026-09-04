@@ -65,6 +65,56 @@ function fmtFechaCorta(iso) {
   return `${d}/${m}/${y}`;
 }
 
+// Domingo de Pascua (algoritmo de Meeus/Jones/Butcher), para ubicar Carnaval y Viernes Santo.
+function domingoDePascua(year) {
+  const a = year % 19;
+  const b = Math.floor(year / 100);
+  const c = year % 100;
+  const d = Math.floor(b / 4);
+  const e = b % 4;
+  const f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4);
+  const k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const mes = Math.floor((h + l - 7 * m + 114) / 31);
+  const dia = ((h + l - 7 * m + 114) % 31) + 1;
+  return new Date(year, mes - 1, dia);
+}
+function sumarDias(date, n) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + n);
+  return d;
+}
+// Feriados nacionales de Argentina de fecha fija o calculable (Pascua). Los feriados "puente
+// turístico" los decreta el gobierno cada año y no se pueden calcular: se cargan a mano como
+// fecha puntual cerrada si hace falta.
+function feriadosArgentina(year) {
+  const pascua = domingoDePascua(year);
+  const lista = [
+    { fecha: new Date(year, 0, 1), nombre: "Año Nuevo" },
+    { fecha: sumarDias(pascua, -48), nombre: "Carnaval" },
+    { fecha: sumarDias(pascua, -47), nombre: "Carnaval" },
+    { fecha: new Date(year, 2, 24), nombre: "Día de la Memoria" },
+    { fecha: sumarDias(pascua, -2), nombre: "Viernes Santo" },
+    { fecha: new Date(year, 3, 2), nombre: "Veteranos de Malvinas" },
+    { fecha: new Date(year, 4, 1), nombre: "Día del Trabajador" },
+    { fecha: new Date(year, 4, 25), nombre: "25 de Mayo" },
+    { fecha: new Date(year, 5, 20), nombre: "Día de la Bandera" },
+    { fecha: new Date(year, 6, 9), nombre: "9 de Julio" },
+    { fecha: new Date(year, 7, 17), nombre: "Día de San Martín" },
+    { fecha: new Date(year, 11, 8), nombre: "Inmaculada Concepción" },
+    { fecha: new Date(year, 11, 25), nombre: "Navidad" },
+  ];
+  const mapa = {};
+  lista.forEach(({ fecha, nombre }) => {
+    mapa[dateKey(fecha.getFullYear(), fecha.getMonth() + 1, fecha.getDate())] = nombre;
+  });
+  return mapa;
+}
+
 // ---- Horarios (turnos) ----
 function minutosDe(hhmm) {
   const [h, m] = String(hhmm || "0:0").split(":").map(Number);
@@ -785,6 +835,10 @@ export default function App() {
                 <span style={S.gapDot} />
                 Hueco sin cubrir
               </span>
+              <span style={S.legendChip}>
+                <span style={S.feriadoDot} />
+                Feriado nacional
+              </span>
             </div>
           </div>
         </div>
@@ -883,11 +937,13 @@ function FeriadoPicker({ onAgregar }) {
 // cada día (como un calendario compartido tipo Google Calendar, con color por vendedor).
 // Marca el día actual, los días cerrados (fijos o feriados) y los huecos de cobertura.
 function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, local, diaSeleccionado, onSelectDia }) {
+  const feriados = feriadosArgentina(year);
   const cells = [];
   for (let i = 0; i < leadBlanks; i++) cells.push(<div key={"b" + i} />);
   for (let d = 1; d <= nDias; d++) {
     const key = dateKey(year, month, d);
     const cerrado = estaCerrado(local, year, month, d);
+    const feriado = feriados[key];
     const entradas = vendedores
       .filter((v) => v.modo === "calendario")
       .map((v) => ({ v, dia: v.dias[key] }))
@@ -904,12 +960,14 @@ function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, lo
     else if (hoy) cellStyle = S.dayCellHoy;
 
     cells.push(
-      <button key={d} onClick={() => onSelectDia(d)} style={cellStyle}>
+      <button key={d} onClick={() => onSelectDia(d)} style={cellStyle} title={feriado || undefined}>
         <span style={cerrado ? S.dayNumRowCerrado : hoy ? S.dayNumRowHoy : S.dayNumRow}>
           {d}
+          {feriado && <span style={S.feriadoDot} />}
           {tieneHueco && <span style={S.gapDot} />}
         </span>
         {cerrado && visibles.length === 0 && <span style={S.cerradoLabel}>Cerrado</span>}
+        {!cerrado && feriado && visibles.length === 0 && <span style={S.feriadoLabel}>{feriado}</span>}
         {visibles.map(({ v, dia }) => (
           <span key={v.id} style={{ ...S.turnoBar, background: v.color }}>{fmtResumenDia(dia)}</span>
         ))}
@@ -1009,6 +1067,7 @@ function TurnoEditorCard({ vendedor, vendedores, local, year, month, nDias, diaS
   };
 
   const cerrado = diaSeleccionado ? estaCerrado(local, year, month, diaSeleccionado) : false;
+  const feriado = diaSeleccionado ? feriadosArgentina(year)[dateKey(year, month, diaSeleccionado)] : null;
   const huecos = diaSeleccionado && !cerrado
     ? huecosDelDia(vendedores, dateKey(year, month, diaSeleccionado), local.horaInicio, local.horaFin)
     : [];
@@ -1029,6 +1088,10 @@ function TurnoEditorCard({ vendedor, vendedores, local, year, month, nDias, diaS
           </div>
         )}
       </div>
+
+      {feriado && (
+        <div style={S.notePlain}>📅 Feriado nacional: {feriado}</div>
+      )}
 
       {cerrado && (
         <div style={S.notePlain}>Este día el local figura cerrado. Igual podés cargar un horario si hace falta (ej. reposición).</div>
@@ -1284,6 +1347,8 @@ const S = {
   dayNumRowHoy: { fontSize: 11, fontWeight: 800, color: ACCENT, padding: "0 2px", display: "flex", alignItems: "center", gap: 3 },
   dayNumRowCerrado: { fontSize: 11, fontWeight: 700, color: SUB, padding: "0 2px", display: "flex", alignItems: "center", gap: 3 },
   cerradoLabel: { fontSize: 8.5, fontWeight: 700, color: SUB, padding: "0 2px" },
+  feriadoDot: { width: 5, height: 5, borderRadius: 99, background: "var(--feriado)", flexShrink: 0, display: "inline-block" },
+  feriadoLabel: { fontSize: 8.5, fontWeight: 700, color: "var(--feriado)", padding: "0 2px" },
   turnoBar: {
     borderRadius: 4, padding: "1.5px 4px", fontSize: 8, fontWeight: 700, color: "#fff",
     whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", lineHeight: 1.5,
@@ -1383,6 +1448,7 @@ const CSS = `
     --warn-bg: #F5EDDD;
     --surface-2: #F5F5F7;
     --surface-input: #FAFAFB;
+    --feriado: #8B6FB0;
   }
   .vdhApp[data-theme="dark"] {
     --accent: #4FA6A6;
@@ -1399,6 +1465,7 @@ const CSS = `
     --warn-bg: #3A2E18;
     --surface-2: #242B2D;
     --surface-input: #1B2224;
+    --feriado: #C7A6E8;
   }
 
   input:focus, select:focus { outline: none; }
