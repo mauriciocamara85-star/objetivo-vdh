@@ -63,8 +63,11 @@ const Store = (p) => <Icon {...p}>
 
 const STORAGE_KEY = "vdh-objetivo-calendario"; // fallback localStorage (sin Firebase configurado)
 const UI_PREFS_KEY = "vdh-objetivo-ui-prefs"; // preferencias locales de navegación (no se comparten)
+const TEMA_KEY = "vdh-objetivo-tema";
 const DATA_VERSION = 2;
 const DIAS_SEMANA = ["L", "M", "M", "J", "V", "S", "D"];
+// Convierte el índice de DIAS_SEMANA (0=Lun...6=Dom) al valor que devuelve Date.getDay() (0=Dom...6=Sab).
+const JS_WEEKDAY_DE_INDICE = [1, 2, 3, 4, 5, 6, 0];
 const MESES = [
   "Enero","Febrero","Marzo","Abril","Mayo","Junio",
   "Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre",
@@ -97,12 +100,20 @@ function firstWeekdayMonFirst(y, m) {
   const jsDay = new Date(y, m - 1, 1).getDay(); // 0=Dom
   return (jsDay + 6) % 7; // 0=Lun
 }
-function isSunday(y, m, d) {
-  return new Date(y, m - 1, d).getDay() === 0;
-}
 function esHoy(y, m, d) {
   const t = new Date();
   return t.getFullYear() === y && t.getMonth() + 1 === m && t.getDate() === d;
+}
+// Cerrado por patrón semanal fijo (ej. "cerramos los domingos") o por fecha puntual (feriado).
+function estaCerrado(local, y, m, d) {
+  const key = dateKey(y, m, d);
+  if ((local.fechasCerradas || []).includes(key)) return true;
+  const wd = new Date(y, m - 1, d).getDay();
+  return (local.diasCerrados || []).includes(wd);
+}
+function fmtFechaCorta(iso) {
+  const [y, m, d] = iso.split("-");
+  return `${d}/${m}/${y}`;
 }
 
 // ---- Horarios (turnos) ----
@@ -207,6 +218,8 @@ function defaultLocal(nombre) {
     objetivoTotal: 0,
     horaInicio: "08:00",
     horaFin: "22:00",
+    diasCerrados: [], // valores de Date.getDay(): 0=Dom...6=Sab
+    fechasCerradas: [], // ["2026-12-25", ...] feriados puntuales
     vendedores: [defaultVendedor("", 0)],
   };
 }
@@ -223,17 +236,21 @@ function defaultSharedData() {
 // se conserva todo lo demás (locales, vendedores, objetivos).
 function migrarDatos(parsed) {
   if (!parsed || !parsed.locales) return defaultSharedData();
-  if (parsed.version === DATA_VERSION) return parsed;
-  const locales = parsed.locales.map((l) => ({
-    ...l,
-    horaInicio: l.horaInicio || "08:00",
-    horaFin: l.horaFin || "22:00",
-    vendedores: l.vendedores.map((v, idx) => ({
-      ...v,
-      color: v.color || PALETA_VENDEDORES[idx % PALETA_VENDEDORES.length],
-      dias: {},
-    })),
-  }));
+  const locales = parsed.locales.map((l) => {
+    const yaEsV2 = parsed.version === DATA_VERSION;
+    return {
+      ...l,
+      horaInicio: l.horaInicio || "08:00",
+      horaFin: l.horaFin || "22:00",
+      diasCerrados: l.diasCerrados || [],
+      fechasCerradas: l.fechasCerradas || [],
+      vendedores: l.vendedores.map((v, idx) => ({
+        ...v,
+        color: v.color || PALETA_VENDEDORES[idx % PALETA_VENDEDORES.length],
+        dias: yaEsV2 ? v.dias || {} : {},
+      })),
+    };
+  });
   return { ...parsed, locales, version: DATA_VERSION };
 }
 
@@ -275,11 +292,21 @@ function App() {
   const [saved, setSaved] = useState(false);
   const [syncMode, setSyncMode] = useState("local"); // "db" | "local"
 
-  // Estado de navegación: es de cada persona/dispositivo, no se sincroniza.
+  // Estado de navegación y preferencias visuales: de cada persona/dispositivo, no se sincroniza.
   const [localActivoId, setLocalActivoId] = useState(null);
   const [vendedorActivo, setVendedorActivo] = useState(null);
   const [diaSeleccionado, setDiaSeleccionado] = useState(null);
   const [localOpen, setLocalOpen] = useState(false);
+  const [tema, setTema] = useState(() => {
+    try {
+      const t = localStorage.getItem(TEMA_KEY);
+      if (t === "light" || t === "dark") return t;
+    } catch (e) {}
+    try {
+      if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) return "dark";
+    } catch (e) {}
+    return "light";
+  });
   const [mesVista, setMesVista] = useState(() => {
     try {
       const raw = localStorage.getItem(UI_PREFS_KEY);
@@ -293,6 +320,11 @@ function App() {
   const lastWrittenRef = useRef(null);
   const saveTimer = useRef(null);
   const initedRef = useRef(false);
+
+  useEffect(() => {
+    try { localStorage.setItem(TEMA_KEY, tema); } catch (e) {}
+    try { document.body.style.background = tema === "dark" ? "#14181A" : "#EDF1F0"; } catch (e) {}
+  }, [tema]);
 
   // Carga inicial: si hay Firebase configurado, se suscribe al documento compartido
   // (todos ven y editan lo mismo, en tiempo real); si no, usa localStorage (un solo dispositivo).
@@ -405,7 +437,7 @@ function App() {
 
   if (!loaded || !sharedData || !localActivoId) {
     return (
-      <div style={S.loadingWrap}>
+      <div className="vdhApp" data-theme={tema} style={S.loadingWrap}>
         <style>{CSS}</style>
         <div style={S.loadingDot} />
       </div>
@@ -423,6 +455,21 @@ function App() {
 
   const updateVendedor = (vid, patch) =>
     updateLocal({ vendedores: local.vendedores.map((v) => (v.id === vid ? { ...v, ...patch } : v)) });
+
+  const toggleDiaCerrado = (wd) => {
+    const actuales = local.diasCerrados || [];
+    const nuevos = actuales.includes(wd) ? actuales.filter((x) => x !== wd) : [...actuales, wd];
+    updateLocal({ diasCerrados: nuevos });
+  };
+  const agregarFechaCerrada = (iso) => {
+    if (!iso) return;
+    const actuales = local.fechasCerradas || [];
+    if (actuales.includes(iso)) return;
+    updateLocal({ fechasCerradas: [...actuales, iso].sort() });
+  };
+  const quitarFechaCerrada = (iso) => {
+    updateLocal({ fechasCerradas: (local.fechasCerradas || []).filter((f) => f !== iso) });
+  };
 
   const addVendedor = () => {
     const nv = defaultVendedor("", local.vendedores.length);
@@ -504,6 +551,31 @@ function App() {
     return copiados;
   };
 
+  // Toma el patrón de la primera semana del mes (días 1 a 7) y lo repite, por día de
+  // semana, en el resto del mes — sin pisar días que ya tengan algo cargado.
+  const repetirSemanaVendedor = (v) => {
+    const patronPorDiaSemana = {};
+    for (let d = 1; d <= Math.min(7, nDias); d++) {
+      const key = dateKey(year, month, d);
+      if (v.dias[key]) patronPorDiaSemana[new Date(year, month - 1, d).getDay()] = v.dias[key];
+    }
+    if (Object.keys(patronPorDiaSemana).length === 0) return 0;
+    const dias = { ...v.dias };
+    let copiados = 0;
+    for (let d = 8; d <= nDias; d++) {
+      const key = dateKey(year, month, d);
+      if (dias[key] !== undefined) continue;
+      const wd = new Date(year, month - 1, d).getDay();
+      const patron = patronPorDiaSemana[wd];
+      if (patron) {
+        dias[key] = { turnos: (patron.turnos || []).map((t) => ({ ...t })) };
+        copiados++;
+      }
+    }
+    if (copiados > 0) updateVendedor(v.id, { dias });
+    return copiados;
+  };
+
   const resetMes = () => {
     updateLocal({
       vendedores: local.vendedores.map((v) => {
@@ -544,7 +616,7 @@ function App() {
   const vActivo = local.vendedores.find((v) => v.id === vendedorActivo) || local.vendedores[0];
 
   return (
-    <div style={S.page}>
+    <div className="vdhApp" data-theme={tema} style={S.page}>
       <style>{CSS}</style>
 
       {/* Header */}
@@ -558,9 +630,18 @@ function App() {
             </div>
           </div>
           <div style={S.headerRight}>
-            <span style={syncMode === "db" ? S.syncBadgeOn : S.syncBadgeOff}>
-              {syncMode === "db" ? "☁ Sincronizado" : "📱 Solo este dispositivo"}
-            </span>
+            <div style={S.headerRightRow}>
+              <span style={syncMode === "db" ? S.syncBadgeOn : S.syncBadgeOff}>
+                {syncMode === "db" ? "☁ Sincronizado" : "📱 Solo este dispositivo"}
+              </span>
+              <button
+                onClick={() => setTema((t) => (t === "dark" ? "light" : "dark"))}
+                style={S.temaBtn}
+                title={tema === "dark" ? "Cambiar a modo claro" : "Cambiar a modo oscuro"}
+              >
+                {tema === "dark" ? "☀️" : "🌙"}
+              </button>
+            </div>
             <div style={{ ...S.savedPill, opacity: saved ? 1 : 0.001 }}>
               <Check size={11} strokeWidth={3} />
               <span>Guardado</span>
@@ -601,8 +682,8 @@ function App() {
       <MonthNav year={year} month={month} onPrev={() => cambiarMes(-1)} onNext={() => cambiarMes(1)} onHoy={irAHoy} />
 
       <div className="appGrid">
-        <div className="colLeft">
-          {/* Local name + objetivo + franja horaria */}
+        {/* Columna izquierda: configuración y edición */}
+        <div className="card-local">
           <div style={S.card}>
             <div style={S.rowBetween}>
               <input
@@ -652,9 +733,40 @@ function App() {
                 </select>
               </label>
             </div>
-          </div>
 
-          {/* Vendedores */}
+            <div style={S.cerradosBlock}>
+              <span style={S.label}>Días cerrados fijos</span>
+              <div style={S.cerradosChipRow}>
+                {DIAS_SEMANA.map((w, i) => {
+                  const wd = JS_WEEKDAY_DE_INDICE[i];
+                  const activo = (local.diasCerrados || []).includes(wd);
+                  return (
+                    <button
+                      key={i}
+                      onClick={() => toggleDiaCerrado(wd)}
+                      style={activo ? S.cerradoChipActivo : S.cerradoChip}
+                    >{w}</button>
+                  );
+                })}
+              </div>
+
+              <span style={{ ...S.label, marginTop: 10, display: "block" }}>Feriados / fechas puntuales cerradas</span>
+              <FeriadoPicker onAgregar={agregarFechaCerrada} />
+              {(local.fechasCerradas || []).length > 0 && (
+                <div style={S.feriadoList}>
+                  {[...(local.fechasCerradas || [])].sort().map((f) => (
+                    <span key={f} style={S.feriadoChip}>
+                      {fmtFechaCorta(f)}
+                      <button onClick={() => quitarFechaCerrada(f)} style={S.feriadoRemove}>×</button>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="card-vendedores">
           <div style={S.card}>
             <div style={S.rowBetween}>
               <div style={S.sectionTitle}>Vendedores</div>
@@ -683,14 +795,30 @@ function App() {
                 prefix={prefix}
                 onChange={(patch) => updateVendedor(vActivo.id, patch)}
                 onCopiarMesAnterior={() => copiarMesAnteriorVendedor(vActivo)}
+                onRepetirSemana={() => repetirSemanaVendedor(vActivo)}
                 onRemove={() => removeVendedor(vActivo.id)}
                 canRemove={local.vendedores.length > 1}
                 horasCalc={horasDeVendedor(vActivo)}
               />
             )}
           </div>
+        </div>
 
-          {/* Calendario compartido de horarios */}
+        <div className="card-turno">
+          <TurnoEditorCard
+            vendedor={vActivo}
+            vendedores={local.vendedores}
+            local={local}
+            year={year} month={month} nDias={nDias}
+            diaSeleccionado={diaSeleccionado}
+            onCambiarDia={setDiaSeleccionado}
+            onSetTurnos={(d, turnos) => setTurnosDia(vActivo, d, turnos)}
+            onQuitarDia={(d) => quitarDiaVendedor(vActivo, d)}
+          />
+        </div>
+
+        {/* Columna central: calendario, grande */}
+        <div className="card-calendario">
           <div style={S.card}>
             <div style={S.sectionTitle}>Calendario de horarios</div>
             <div style={S.miniStat}>Tocá un día para cargar el horario del vendedor seleccionado</div>
@@ -698,7 +826,7 @@ function App() {
               <SharedCalendar
                 year={year} month={month} nDias={nDias} leadBlanks={leadBlanks} prefix={prefix}
                 vendedores={local.vendedores}
-                horaInicio={local.horaInicio} horaFin={local.horaFin}
+                local={local}
                 diaSeleccionado={diaSeleccionado}
                 onSelectDia={setDiaSeleccionado}
               />
@@ -718,63 +846,49 @@ function App() {
           </div>
         </div>
 
-        <div className="colRight">
-          <div className="stickyGroup">
-            {/* Editor de horario del día seleccionado */}
-            <TurnoEditorCard
-              vendedor={vActivo}
-              vendedores={local.vendedores}
-              local={local}
-              year={year} month={month} nDias={nDias}
-              diaSeleccionado={diaSeleccionado}
-              onCambiarDia={setDiaSeleccionado}
-              onSetTurnos={(d, turnos) => setTurnosDia(vActivo, d, turnos)}
-              onQuitarDia={(d) => quitarDiaVendedor(vActivo, d)}
-            />
-
-            {/* Resultado */}
-            <div style={S.card}>
-              <div style={S.rowBetween}>
-                <div>
-                  <div style={S.eyebrowLine}>// REPARTO DEL MES</div>
-                  <div style={S.sectionTitle}>{MESES[month - 1]}</div>
-                </div>
-                <button onClick={resetMes} style={S.smallGhostBtn}>Reiniciar mes</button>
+        {/* Columna derecha: reparto del mes */}
+        <div className="card-ranking">
+          <div style={S.card}>
+            <div style={S.rowBetween}>
+              <div>
+                <div style={S.eyebrowLine}>// REPARTO DEL MES</div>
+                <div style={S.sectionTitle}>{MESES[month - 1]}</div>
               </div>
-
-              <div style={S.rankList}>
-                {[...filas]
-                  .sort((a, b) => b.pct - a.pct)
-                  .map((f, i) => (
-                    <div key={f.id} style={i === 0 ? S.rankCardTop : S.rankCard}>
-                      <div style={S.rankBadge}>
-                        <span style={{ ...S.rankDot, background: f.color }} />
-                      </div>
-                      <div style={S.rankInfo}>
-                        <div style={S.rankName}>{f.nombre || "Sin nombre"}</div>
-                        <div style={S.rankSub}>{fmt(f.horas, 1)} hs este mes</div>
-                      </div>
-                      <div style={S.rankRight}>
-                        <div style={S.rankPct}>{fmt(f.pct, 1)}%</div>
-                        {local.objetivoTotal > 0 && (
-                          <div style={S.rankMoney}>{fmtMoney(f.monto)}</div>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-              </div>
-
-              <div style={S.rowBetween2}>
-                <span style={S.miniStat}>Total repartido</span>
-                <span style={S.miniStatStrong}>
-                  {fmt(pctTotal, 1)}%{local.objetivoTotal > 0 && ` · ${fmtMoney(montoTotal)}`}
-                </span>
-              </div>
-
-              {horasTotalesVendedores === 0 && (
-                <div style={S.note}>Marcá los horarios trabajados de al menos un vendedor para ver el reparto.</div>
-              )}
+              <button onClick={resetMes} style={S.smallGhostBtn}>Reiniciar mes</button>
             </div>
+
+            <div style={S.rankList}>
+              {[...filas]
+                .sort((a, b) => b.pct - a.pct)
+                .map((f, i) => (
+                  <div key={f.id} style={i === 0 ? S.rankCardTop : S.rankCard}>
+                    <div style={S.rankBadge}>
+                      <span style={{ ...S.rankDot, background: f.color }} />
+                    </div>
+                    <div style={S.rankInfo}>
+                      <div style={S.rankName}>{f.nombre || "Sin nombre"}</div>
+                      <div style={S.rankSub}>{fmt(f.horas, 1)} hs este mes</div>
+                    </div>
+                    <div style={S.rankRight}>
+                      <div style={S.rankPct}>{fmt(f.pct, 1)}%</div>
+                      {local.objetivoTotal > 0 && (
+                        <div style={S.rankMoney}>{fmtMoney(f.monto)}</div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+            </div>
+
+            <div style={S.rowBetween2}>
+              <span style={S.miniStat}>Total repartido</span>
+              <span style={S.miniStatStrong}>
+                {fmt(pctTotal, 1)}%{local.objetivoTotal > 0 && ` · ${fmtMoney(montoTotal)}`}
+              </span>
+            </div>
+
+            {horasTotalesVendedores === 0 && (
+              <div style={S.note}>Marcá los horarios trabajados de al menos un vendedor para ver el reparto.</div>
+            )}
           </div>
         </div>
       </div>
@@ -793,34 +907,55 @@ function MonthNav({ year, month, onPrev, onNext, onHoy }) {
   );
 }
 
+function FeriadoPicker({ onAgregar }) {
+  const [valor, setValor] = useState("");
+  return (
+    <div style={S.feriadoPickerRow}>
+      <input
+        type="date"
+        value={valor}
+        onChange={(e) => setValor(e.target.value)}
+        style={S.input}
+      />
+      <button
+        onClick={() => { if (valor) { onAgregar(valor); setValor(""); } }}
+        style={S.copyBtn}
+      >Agregar</button>
+    </div>
+  );
+}
+
 // Calendario que muestra, para TODOS los vendedores del local, los turnos cargados
 // cada día (como un calendario compartido tipo Google Calendar, con color por vendedor).
-// Marca el día actual y señala los días con huecos de cobertura sin cubrir.
-function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, horaInicio, horaFin, diaSeleccionado, onSelectDia }) {
+// Marca el día actual, los días cerrados (fijos o feriados) y los huecos de cobertura.
+function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, local, diaSeleccionado, onSelectDia }) {
   const cells = [];
   for (let i = 0; i < leadBlanks; i++) cells.push(<div key={"b" + i} />);
   for (let d = 1; d <= nDias; d++) {
     const key = dateKey(year, month, d);
+    const cerrado = estaCerrado(local, year, month, d);
     const entradas = vendedores
       .filter((v) => v.modo === "calendario")
       .map((v) => ({ v, dia: v.dias[key] }))
       .filter((x) => x.dia && x.dia.turnos && x.dia.turnos.length > 0);
-    const visibles = entradas.slice(0, 3);
+    const visibles = entradas.slice(0, 4);
     const resto = entradas.length - visibles.length;
     const seleccionado = diaSeleccionado === d;
     const hoy = esHoy(year, month, d);
-    const tieneHueco = huecosDelDia(vendedores, key, horaInicio, horaFin).length > 0;
+    const tieneHueco = !cerrado && huecosDelDia(vendedores, key, local.horaInicio, local.horaFin).length > 0;
 
     let cellStyle = S.dayCell;
     if (seleccionado) cellStyle = S.dayCellSelected;
+    else if (cerrado) cellStyle = S.dayCellCerrado;
     else if (hoy) cellStyle = S.dayCellHoy;
 
     cells.push(
       <button key={d} onClick={() => onSelectDia(d)} style={cellStyle}>
-        <span style={hoy ? S.dayNumRowHoy : S.dayNumRow}>
+        <span style={cerrado ? S.dayNumRowCerrado : hoy ? S.dayNumRowHoy : S.dayNumRow}>
           {d}
           {tieneHueco && <span style={S.gapDot} />}
         </span>
+        {cerrado && visibles.length === 0 && <span style={S.cerradoLabel}>Cerrado</span>}
         {visibles.map(({ v, dia }) => (
           <span key={v.id} style={{ ...S.turnoBar, background: v.color }}>{fmtResumenDia(dia)}</span>
         ))}
@@ -840,14 +975,19 @@ function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, ho
   );
 }
 
-function VendedorEditor({ v, prefix, onChange, onCopiarMesAnterior, onRemove, canRemove, horasCalc }) {
+function VendedorEditor({ v, prefix, onChange, onCopiarMesAnterior, onRepetirSemana, onRemove, canRemove, horasCalc }) {
   const diasMarcados = Object.keys(v.dias).filter((k) => k.startsWith(prefix)).length;
-  const [copiadoMsg, setCopiadoMsg] = useState("");
+  const [msg, setMsg] = useState("");
 
   const handleCopiar = () => {
     const n = onCopiarMesAnterior();
-    setCopiadoMsg(n > 0 ? `Se copiaron ${n} días` : "No hay días el mes pasado para copiar");
-    setTimeout(() => setCopiadoMsg(""), 2500);
+    setMsg(n > 0 ? `Se copiaron ${n} días del mes anterior` : "No hay días el mes pasado para copiar");
+    setTimeout(() => setMsg(""), 2500);
+  };
+  const handleRepetir = () => {
+    const n = onRepetirSemana();
+    setMsg(n > 0 ? `Se repitieron ${n} días según la primera semana` : "Cargá al menos un día en la primera semana (1 al 7) para repetir");
+    setTimeout(() => setMsg(""), 2500);
   };
 
   return (
@@ -877,11 +1017,12 @@ function VendedorEditor({ v, prefix, onChange, onCopiarMesAnterior, onRemove, ca
 
       {v.modo === "calendario" ? (
         <>
+          <div style={S.miniStat}>{diasMarcados} días marcados · {fmt(horasCalc, 1)} hs este mes</div>
           <div style={S.rowBetween3}>
-            <span style={S.miniStat}>{diasMarcados} días marcados · {fmt(horasCalc, 1)} hs este mes</span>
             <button onClick={handleCopiar} style={S.copyBtn}>Copiar mes anterior</button>
+            <button onClick={handleRepetir} style={S.copyBtn}>Repetir 1ª semana</button>
           </div>
-          {copiadoMsg && <div style={S.copiadoMsg}>{copiadoMsg}</div>}
+          {msg && <div style={S.copiadoMsg}>{msg}</div>}
         </>
       ) : (
         <div style={S.twoCol}>
@@ -913,7 +1054,8 @@ function TurnoEditorCard({ vendedor, vendedores, local, year, month, nDias, diaS
     onCambiarDia(nuevo);
   };
 
-  const huecos = diaSeleccionado
+  const cerrado = diaSeleccionado ? estaCerrado(local, year, month, diaSeleccionado) : false;
+  const huecos = diaSeleccionado && !cerrado
     ? huecosDelDia(vendedores, dateKey(year, month, diaSeleccionado), local.horaInicio, local.horaFin)
     : [];
 
@@ -933,6 +1075,10 @@ function TurnoEditorCard({ vendedor, vendedores, local, year, month, nDias, diaS
           </div>
         )}
       </div>
+
+      {cerrado && (
+        <div style={S.notePlain}>Este día el local figura cerrado. Igual podés cargar un horario si hace falta (ej. reposición).</div>
+      )}
 
       {huecos.length > 0 && (
         <div style={S.gapWarning}>
@@ -1024,42 +1170,44 @@ function TurnoEditorDia({ vendedor, local, year, month, dia, onSetTurnos, onQuit
   );
 }
 
-/* ---------- estilo: ranking VDH, en azul petróleo ---------- */
+/* ---------- estilo: ranking VDH, en azul petróleo (con variables para modo oscuro) ---------- */
 
-const ACCENT = "#2C6E71";
-const ACCENT_SOFT = "#E3EFEE";
-const INK = "#232823";
-const SUB = "#8C9089";
-const BG = "#EDF1F0";
-const CARD = "#FFFFFF";
-const LINE = "#E7E4DA";
-const GOOD = "#2C6E71";
-const DANGER = "#A97A66";
-const DANGER_BG = "#F2E9E4";
-const WARN = "#C98A2E";
-const WARN_BG = "#F5EDDD";
+const ACCENT = "var(--accent)";
+const ACCENT_SOFT = "var(--accent-soft)";
+const INK = "var(--ink)";
+const SUB = "var(--sub)";
+const BG = "var(--bg)";
+const CARD = "var(--card)";
+const LINE = "var(--line)";
+const GOOD = "var(--good)";
+const DANGER = "var(--danger)";
+const DANGER_BG = "var(--danger-bg)";
+const WARN = "var(--warn)";
+const WARN_BG = "var(--warn-bg)";
+const SURFACE_2 = "var(--surface-2)";
+const SURFACE_INPUT = "var(--surface-input)";
 
 const S = {
   page: {
     minHeight: "100vh", background: BG, color: INK,
     fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif",
-    padding: "24px 20px 48px", maxWidth: 1080, margin: "0 auto",
+    padding: "24px 20px 48px", maxWidth: 1400, margin: "0 auto",
   },
   loadingWrap: { minHeight: "100vh", background: BG, display: "flex", alignItems: "center", justifyContent: "center" },
   loadingDot: { width: 10, height: 10, borderRadius: 99, background: ACCENT, animation: "pulse 1s infinite ease-in-out" },
-  header: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 },
   headerBand: {
     background: CARD, borderRadius: 18, padding: "14px 15px", marginBottom: 12,
     boxShadow: "0 1px 2px rgba(0,0,0,0.04), 0 8px 20px -12px rgba(0,0,0,0.08)",
   },
   headerTop: { display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 12 },
   headerRight: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3 },
+  headerRightRow: { display: "flex", alignItems: "center", gap: 8 },
   logoRow: { display: "flex", alignItems: "center", gap: 9 },
   logoMark: {
     width: 34, height: 34, borderRadius: 9, background: ACCENT, color: "#fff",
     display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 800, letterSpacing: "-0.02em",
   },
-  brandTitle: { fontSize: 16, fontWeight: 800, letterSpacing: "-0.01em", lineHeight: 1.15 },
+  brandTitle: { fontSize: 16, fontWeight: 800, letterSpacing: "-0.01em", lineHeight: 1.15, color: INK },
   brandSubtitle: { fontSize: 9.5, fontWeight: 700, letterSpacing: "0.05em", color: SUB, marginTop: 1 },
   savedPill: {
     display: "flex", alignItems: "center", gap: 3, fontSize: 10.5, fontWeight: 700,
@@ -1067,6 +1215,10 @@ const S = {
   },
   syncBadgeOn: { fontSize: 9.5, fontWeight: 700, color: ACCENT },
   syncBadgeOff: { fontSize: 9.5, fontWeight: 700, color: SUB },
+  temaBtn: {
+    width: 22, height: 22, borderRadius: 999, border: "none", background: "transparent",
+    fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
+  },
   localDropdownWrap: { position: "relative" },
   localDropdownBtn: {
     width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
@@ -1112,7 +1264,7 @@ const S = {
   nameInput: { fontSize: 16, fontWeight: 700, border: "none", background: "transparent", outline: "none", color: INK, flex: 1 },
   nameInputSm: {
     fontSize: 14, fontWeight: 700, color: INK, flex: 1, outline: "none",
-    border: `1.5px solid ${LINE}`, borderRadius: 9, background: "#FAFAFB",
+    border: `1.5px solid ${LINE}`, borderRadius: 9, background: SURFACE_INPUT,
     padding: "8px 10px",
   },
   twoCol: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
@@ -1120,62 +1272,69 @@ const S = {
   label: { fontSize: 11, color: SUB, fontWeight: 600 },
   input: {
     border: `1px solid ${LINE}`, borderRadius: 10, padding: "9px 10px", fontSize: 14,
-    color: INK, background: "#FAFAFB", outline: "none", width: "100%", boxSizing: "border-box",
+    color: INK, background: SURFACE_INPUT, outline: "none", width: "100%", boxSizing: "border-box",
   },
   iconGhost: {
     width: 28, height: 28, borderRadius: 8, border: "none", background: DANGER_BG, color: DANGER,
     display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0,
   },
-  sectionLabel: { fontSize: 12, color: SUB, fontWeight: 600, margin: "2px 0 8px" },
-  sectionTitle: { fontSize: 15, fontWeight: 700 },
+  sectionTitle: { fontSize: 15, fontWeight: 700, color: INK },
   addBtn: {
     display: "flex", alignItems: "center", gap: 4, fontSize: 12.5, fontWeight: 700, color: "#fff",
     background: ACCENT, border: "none", borderRadius: 10, padding: "7px 11px", cursor: "pointer",
   },
   smallGhostBtn: {
-    fontSize: 11.5, fontWeight: 600, color: SUB, background: "#F5F5F7", border: "none",
+    fontSize: 11.5, fontWeight: 600, color: SUB, background: SURFACE_2, border: "none",
     borderRadius: 8, padding: "7px 10px", cursor: "pointer",
   },
   miniStat: { fontSize: 11.5, color: SUB, fontWeight: 600, marginTop: 4 },
   monthNav: { display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 10 },
   navBtn: {
-    width: 28, height: 28, borderRadius: 999, border: `1px solid ${LINE}`, background: "#FAFAFB",
+    width: 28, height: 28, borderRadius: 999, border: `1px solid ${LINE}`, background: SURFACE_INPUT,
     color: INK, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer",
   },
   navBtnSm: {
-    width: 22, height: 22, borderRadius: 999, border: `1px solid ${LINE}`, background: "#FAFAFB",
+    width: 22, height: 22, borderRadius: 999, border: `1px solid ${LINE}`, background: SURFACE_INPUT,
     color: INK, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0,
   },
   hoyBtn: {
     fontSize: 11.5, fontWeight: 700, color: ACCENT, background: ACCENT_SOFT, border: "none",
     borderRadius: 999, padding: "6px 13px", cursor: "pointer", marginLeft: 4,
   },
-  monthLabel: { fontSize: 14, fontWeight: 700, minWidth: 120, textAlign: "center" },
+  monthLabel: { fontSize: 14, fontWeight: 700, minWidth: 120, textAlign: "center", color: INK },
   weekHeader: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", marginBottom: 4 },
   weekHeaderCell: { fontSize: 10.5, color: SUB, fontWeight: 700, textAlign: "center" },
-  grid: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4 },
+  grid: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 5 },
   dayCell: {
-    minHeight: 62, border: "none", borderRadius: 10, background: "#F5F5F7", color: INK,
+    minHeight: 82, border: "none", borderRadius: 10, background: SURFACE_2, color: INK,
     cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "stretch",
-    justifyContent: "flex-start", padding: "4px 3px", gap: 2, textAlign: "left", boxSizing: "border-box",
+    justifyContent: "flex-start", padding: "5px 4px", gap: 3, textAlign: "left", boxSizing: "border-box",
   },
   dayCellSelected: {
-    minHeight: 62, border: `1.5px solid ${ACCENT}`, borderRadius: 10, background: ACCENT_SOFT, color: INK,
+    minHeight: 82, border: `1.5px solid ${ACCENT}`, borderRadius: 10, background: ACCENT_SOFT, color: INK,
     cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "stretch",
-    justifyContent: "flex-start", padding: "3.5px 2.5px", gap: 2, textAlign: "left", boxSizing: "border-box",
+    justifyContent: "flex-start", padding: "4.5px 3.5px", gap: 3, textAlign: "left", boxSizing: "border-box",
   },
   dayCellHoy: {
-    minHeight: 62, border: `1.5px solid ${ACCENT}`, borderRadius: 10, background: "#F5F5F7", color: INK,
+    minHeight: 82, border: `1.5px solid ${ACCENT}`, borderRadius: 10, background: SURFACE_2, color: INK,
     cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "stretch",
-    justifyContent: "flex-start", padding: "3.5px 2.5px", gap: 2, textAlign: "left", boxSizing: "border-box",
+    justifyContent: "flex-start", padding: "4.5px 3.5px", gap: 3, textAlign: "left", boxSizing: "border-box",
   },
-  dayNumRow: { fontSize: 10.5, fontWeight: 700, color: INK, padding: "0 2px", display: "flex", alignItems: "center", gap: 3 },
-  dayNumRowHoy: { fontSize: 10.5, fontWeight: 800, color: ACCENT, padding: "0 2px", display: "flex", alignItems: "center", gap: 3 },
+  dayCellCerrado: {
+    minHeight: 82, border: "none", borderRadius: 10, color: SUB,
+    background: `repeating-linear-gradient(135deg, ${SURFACE_2}, ${SURFACE_2} 6px, transparent 6px, transparent 12px), ${CARD}`,
+    cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "stretch",
+    justifyContent: "flex-start", padding: "5px 4px", gap: 3, textAlign: "left", boxSizing: "border-box",
+  },
+  dayNumRow: { fontSize: 11, fontWeight: 700, color: INK, padding: "0 2px", display: "flex", alignItems: "center", gap: 3 },
+  dayNumRowHoy: { fontSize: 11, fontWeight: 800, color: ACCENT, padding: "0 2px", display: "flex", alignItems: "center", gap: 3 },
+  dayNumRowCerrado: { fontSize: 11, fontWeight: 700, color: SUB, padding: "0 2px", display: "flex", alignItems: "center", gap: 3 },
+  cerradoLabel: { fontSize: 8.5, fontWeight: 700, color: SUB, padding: "0 2px" },
   turnoBar: {
-    borderRadius: 4, padding: "1px 3px", fontSize: 7.5, fontWeight: 700, color: "#fff",
-    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", lineHeight: 1.4,
+    borderRadius: 4, padding: "1.5px 4px", fontSize: 8, fontWeight: 700, color: "#fff",
+    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", lineHeight: 1.5,
   },
-  moreBadge: { fontSize: 7.5, fontWeight: 700, color: SUB, padding: "0 3px" },
+  moreBadge: { fontSize: 8, fontWeight: 700, color: SUB, padding: "0 3px" },
   gapDot: { width: 5, height: 5, borderRadius: 99, background: WARN, flexShrink: 0, display: "inline-block" },
   gapWarning: {
     fontSize: 11.5, fontWeight: 600, color: WARN, background: WARN_BG, borderRadius: 9,
@@ -1186,21 +1345,21 @@ const S = {
   legendDot: { width: 8, height: 8, borderRadius: 99, flexShrink: 0, display: "inline-block" },
   modeRow: { display: "flex", gap: 6, marginBottom: 10 },
   modeBtn: {
-    flex: 1, fontSize: 12, fontWeight: 600, color: SUB, background: "#F5F5F7", border: "none",
+    flex: 1, fontSize: 12, fontWeight: 600, color: SUB, background: SURFACE_2, border: "none",
     borderRadius: 9, padding: "7px 0", cursor: "pointer",
   },
   modeBtnActive: {
-    flex: 1, fontSize: 12, fontWeight: 700, color: "#fff", background: INK, border: "none",
+    flex: 1, fontSize: 12, fontWeight: 700, color: "#fff", background: ACCENT, border: "none",
     borderRadius: 9, padding: "7px 0", cursor: "pointer",
   },
-  rowBetween3: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 6, flexWrap: "wrap" },
+  rowBetween3: { display: "flex", alignItems: "center", gap: 8, marginTop: 8, flexWrap: "wrap" },
   copyBtn: {
     fontSize: 11, fontWeight: 700, color: ACCENT, background: ACCENT_SOFT, border: "none",
-    borderRadius: 7, padding: "5px 9px", cursor: "pointer", whiteSpace: "nowrap", marginTop: 8,
+    borderRadius: 7, padding: "6px 10px", cursor: "pointer", whiteSpace: "nowrap",
   },
-  copiadoMsg: { fontSize: 11, color: ACCENT, fontWeight: 600, marginTop: 5 },
+  copiadoMsg: { fontSize: 11, color: ACCENT, fontWeight: 600, marginTop: 6 },
   note: { fontSize: 11.5, color: DANGER, lineHeight: 1.4 },
-  notePlain: { fontSize: 11.5, color: SUB, lineHeight: 1.4 },
+  notePlain: { fontSize: 11.5, color: SUB, lineHeight: 1.4, marginBottom: 10 },
   eyebrowLine: { fontSize: 10.5, fontWeight: 700, color: SUB, marginBottom: 2 },
   turnoEditorTitle: { display: "flex", alignItems: "center", gap: 7, fontSize: 14, fontWeight: 700, color: INK },
   dayNavRow: { display: "flex", alignItems: "center", gap: 6 },
@@ -1208,7 +1367,7 @@ const S = {
   turnoRow: { display: "flex", alignItems: "center", gap: 6, marginBottom: 8 },
   turnoSelect: {
     flex: 1, border: `1px solid ${LINE}`, borderRadius: 9, padding: "8px 6px", fontSize: 13,
-    color: INK, background: "#FAFAFB", outline: "none", minWidth: 0,
+    color: INK, background: SURFACE_INPUT, outline: "none", minWidth: 0,
   },
   turnoA: { fontSize: 11.5, color: SUB, fontWeight: 600, flexShrink: 0 },
   rankList: { display: "flex", flexDirection: "column", gap: 8 },
@@ -1232,31 +1391,85 @@ const S = {
     borderTop: `1px solid ${LINE}`,
   },
   miniStatStrong: { fontSize: 12.5, fontWeight: 800, color: INK },
+  cerradosBlock: { marginTop: 12, paddingTop: 12, borderTop: `1px solid ${LINE}` },
+  cerradosChipRow: { display: "flex", gap: 5, marginTop: 6 },
+  cerradoChip: {
+    width: 30, height: 30, borderRadius: 8, border: `1px solid ${LINE}`, background: SURFACE_INPUT,
+    color: SUB, fontSize: 12, fontWeight: 700, cursor: "pointer",
+  },
+  cerradoChipActivo: {
+    width: 30, height: 30, borderRadius: 8, border: "none", background: DANGER_BG,
+    color: DANGER, fontSize: 12, fontWeight: 700, cursor: "pointer",
+  },
+  feriadoPickerRow: { display: "flex", gap: 6, marginTop: 6 },
+  feriadoList: { display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 },
+  feriadoChip: {
+    display: "flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 600, color: INK,
+    background: SURFACE_2, borderRadius: 999, padding: "4px 4px 4px 10px",
+  },
+  feriadoRemove: {
+    width: 16, height: 16, borderRadius: 99, border: "none", background: "transparent", color: SUB,
+    fontSize: 13, lineHeight: 1, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+  },
 };
 
 const CSS = `
+  .vdhApp {
+    --accent: #2C6E71;
+    --accent-soft: #E3EFEE;
+    --ink: #232823;
+    --sub: #8C9089;
+    --bg: #EDF1F0;
+    --card: #FFFFFF;
+    --line: #E7E4DA;
+    --good: #2C6E71;
+    --danger: #A97A66;
+    --danger-bg: #F2E9E4;
+    --warn: #C98A2E;
+    --warn-bg: #F5EDDD;
+    --surface-2: #F5F5F7;
+    --surface-input: #FAFAFB;
+  }
+  .vdhApp[data-theme="dark"] {
+    --accent: #4FA6A6;
+    --accent-soft: #1E3536;
+    --ink: #E7EBE8;
+    --sub: #93A19C;
+    --bg: #14181A;
+    --card: #1D2224;
+    --line: #2B3234;
+    --good: #4FA6A6;
+    --danger: #D69A82;
+    --danger-bg: #3A2A22;
+    --warn: #E3B15E;
+    --warn-bg: #3A2E18;
+    --surface-2: #242B2D;
+    --surface-input: #1B2224;
+  }
+
   input:focus, select:focus { outline: none; }
   input[style*="border"]:focus, select[style*="border"]:focus { border-color: ${ACCENT} !important; }
   button { -webkit-tap-highlight-color: transparent; }
   @keyframes pulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.6); opacity: 0.5; } }
 
-  .appGrid { display: flex; flex-direction: column; }
-  .colLeft, .colRight { display: flex; flex-direction: column; }
+  .appGrid { display: flex; flex-direction: column; gap: 12px; }
 
-  @media (min-width: 860px) {
+  @media (min-width: 900px) {
     .appGrid {
       display: grid;
-      grid-template-columns: 1.35fr 1fr;
+      grid-template-columns: 300px minmax(0, 1fr) 320px;
+      grid-template-areas:
+        "local calendario ranking"
+        "vendedores calendario ranking"
+        "turno calendario ranking";
       gap: 16px;
       align-items: start;
     }
-    .colRight .stickyGroup {
-      position: sticky;
-      top: 20px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
+    .card-local { grid-area: local; }
+    .card-vendedores { grid-area: vendedores; }
+    .card-turno { grid-area: turno; position: sticky; top: 20px; }
+    .card-calendario { grid-area: calendario; }
+    .card-ranking { grid-area: ranking; position: sticky; top: 20px; }
     .localDropdownOuter { max-width: 320px; }
   }
 `;
