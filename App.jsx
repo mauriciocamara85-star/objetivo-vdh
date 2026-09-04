@@ -1355,21 +1355,33 @@ function TurnoEditorCard({ vendedor, vendedores, local, fecha, onCambiarFecha, o
         )}
       </div>
 
-      {fecha && (
-        <div style={S.diaResumenBlock}>
-          {vendedores.filter((v) => v.modo === "calendario").map((v) => {
-            const dia = v.dias[dateKey(fecha.year, fecha.month, fecha.day)];
-            const turnos = dia?.turnos || [];
-            return (
-              <div key={v.id} style={S.diaResumenRow}>
-                <span style={{ ...S.legendDot, background: v.color }} />
-                <span style={S.diaResumenNombre}>{v.nombre || "Sin nombre"}</span>
-                <span style={S.diaResumenHoras}>{turnos.length ? fmtResumenDia(dia) : "sin horario"}</span>
+      {fecha && (() => {
+        const key = dateKey(fecha.year, fecha.month, fecha.day);
+        const calendario = vendedores.filter((v) => v.modo === "calendario");
+        const conHorario = calendario.filter((v) => v.dias[key]?.turnos?.length);
+        const sinHorario = calendario.filter((v) => !v.dias[key]?.turnos?.length);
+        if (conHorario.length === 0 && sinHorario.length === 0) return null;
+        return (
+          <div style={S.diaResumenBlock}>
+            {conHorario.length === 0 ? (
+              <div style={S.notePlainSinMargen}>Nadie tiene horario cargado este día.</div>
+            ) : (
+              conHorario.map((v) => (
+                <div key={v.id} style={S.diaResumenRow}>
+                  <span style={{ ...S.legendDot, background: v.color }} />
+                  <span style={S.diaResumenNombre}>{v.nombre || "Sin nombre"}</span>
+                  <span style={S.diaResumenHoras}>{fmtResumenDia(v.dias[key])}</span>
+                </div>
+              ))
+            )}
+            {sinHorario.length > 0 && (
+              <div style={S.diaResumenSinHorario}>
+                No trabajan: {sinHorario.map((v) => v.nombre || "Sin nombre").join(", ")}
               </div>
-            );
-          })}
-        </div>
-      )}
+            )}
+          </div>
+        );
+      })()}
 
       {feriado && (
         <div style={S.notePlain}>📅 Feriado nacional: {feriado}</div>
@@ -1544,7 +1556,7 @@ const S = {
     background: "transparent", border: "none", borderRadius: 8, padding: "9px 10px", cursor: "pointer", textAlign: "left",
     borderTop: `1px solid ${LINE}`, marginTop: 2,
   },
-  chipRow: { display: "flex", gap: 6, marginBottom: 12, overflowX: "auto", paddingBottom: 2 },
+  chipRow: { display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 },
   chip: {
     fontSize: 12.5, fontWeight: 600, color: SUB, background: CARD, border: `1px solid ${LINE}`,
     borderRadius: 999, padding: "7px 12px", whiteSpace: "nowrap", flexShrink: 0, cursor: "pointer",
@@ -1681,6 +1693,8 @@ const S = {
   diaResumenRow: { display: "flex", alignItems: "center", gap: 6, fontSize: 11.5 },
   diaResumenNombre: { fontWeight: 700, color: INK, flexShrink: 0 },
   diaResumenHoras: { color: SUB, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  diaResumenSinHorario: { fontSize: 10.5, color: SUB, fontWeight: 600, marginTop: 4, paddingTop: 5, borderTop: `1px solid ${LINE}` },
+  notePlainSinMargen: { fontSize: 11.5, color: SUB, lineHeight: 1.4 },
   dayNavRow: { display: "flex", alignItems: "center", gap: 6 },
   dayNavLabel: { fontSize: 11.5, fontWeight: 700, color: INK, minWidth: 56, textAlign: "center" },
   turnoRow: { display: "flex", alignItems: "center", gap: 6, marginBottom: 8 },
@@ -1802,6 +1816,12 @@ const CSS = `
     --surface-input: #1B2224;
     --feriado: #C7A6E8;
   }
+
+  * { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+  *::-webkit-scrollbar { width: 8px; height: 8px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb { background: var(--line); border-radius: 99px; }
+  *::-webkit-scrollbar-thumb:hover { background: var(--sub); }
 
   input:focus, select:focus { outline: none; }
   input[style*="border"]:focus, select[style*="border"]:focus { border-color: ${ACCENT} !important; }
