@@ -25,9 +25,14 @@
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef } = React;
 
-// Pegar acá el objeto de configuración de Firebase (Configuración del proyecto → Tus apps → Web).
-// Ejemplo: { apiKey: "AIza...", authDomain: "objetivo-vdh.firebaseapp.com", projectId: "objetivo-vdh", ... }
-const FIREBASE_CONFIG = {};
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyAxCSmQ3bTMhH1PY4RVGPuO-HEfppnvw7A",
+  authDomain: "objetivo-vdh.firebaseapp.com",
+  projectId: "objetivo-vdh",
+  storageBucket: "objetivo-vdh.firebasestorage.app",
+  messagingSenderId: "10555426781",
+  appId: "1:10555426781:web:5c657042bb9c779c4e5834",
+};
 
 function tieneFirebaseConfig(cfg) {
   return !!(cfg && cfg.apiKey && cfg.projectId);
