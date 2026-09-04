@@ -214,7 +214,6 @@ function mergeIntervalos(intervalos) {
 function huecosDelDia(vendedores, key, horaInicio, horaFin) {
   const intervalos = [];
   vendedores.forEach((v) => {
-    if (v.modo !== "calendario") return;
     const turnos = v.dias[key]?.turnos;
     if (!turnos) return;
     turnos.forEach((t) => intervalos.push([minutosDe(t.inicio), minutosDe(t.fin)]));
@@ -256,10 +255,7 @@ function defaultVendedor(nombre, colorIndex) {
     id: uid(),
     nombre,
     color: PALETA_VENDEDORES[colorIndex % PALETA_VENDEDORES.length],
-    modo: "calendario", // "calendario" | "patron"
     dias: {}, // { "2026-09-05": { turnos: [{inicio:"09:00", fin:"17:00"}, ...] } }
-    diasSemana: 5,
-    horasDiaPatron: 8,
   };
 }
 
@@ -381,6 +377,7 @@ export default function App() {
   const [vendedorActivo, setVendedorActivo] = useState(null);
   const [fechaSeleccionada, setFechaSeleccionada] = useState(null); // { year, month, day } | null
   const [localOpen, setLocalOpen] = useState(false);
+  const [configAbierta, setConfigAbierta] = useState(false); // acordeón de "Configuración del local"
   const [vista, setVista] = useState("mes"); // "mes" | "semana" | "dia"
   const [semanaInicio, setSemanaInicio] = useState(() => lunesDeLaSemana(now));
   const [tema, setTema] = useState(() => {
@@ -739,9 +736,6 @@ export default function App() {
 
   // Cálculos
   function horasDeVendedor(v) {
-    if (v.modo === "patron") {
-      return (Number(v.diasSemana) || 0) * (Number(v.horasDiaPatron) || 0) * 4.345;
-    }
     return Object.entries(v.dias)
       .filter(([k]) => k.startsWith(prefix))
       .reduce((s, [, diaObj]) => s + horasDelDia(diaObj), 0);
@@ -862,62 +856,81 @@ export default function App() {
                 placeholder="Opcional"
               />
             </label>
-            <div style={{ ...S.twoCol, marginTop: 10 }}>
-              <label style={S.field}>
-                <span style={S.label}>Local abre desde</span>
-                <select
-                  value={local.horaInicio}
-                  onChange={(e) => updateLocal({ horaInicio: e.target.value })}
-                  style={S.input}
-                >
-                  {generarOpcionesHora("00:00", "23:30").map((h) => (
-                    <option key={h} value={h}>{h}</option>
-                  ))}
-                </select>
-              </label>
-              <label style={S.field}>
-                <span style={S.label}>Hasta</span>
-                <select
-                  value={local.horaFin}
-                  onChange={(e) => updateLocal({ horaFin: e.target.value })}
-                  style={S.input}
-                >
-                  {generarOpcionesHora("00:00", "23:30").map((h) => (
-                    <option key={h} value={h}>{h}</option>
-                  ))}
-                </select>
-              </label>
-            </div>
 
-            <div style={S.cerradosBlock}>
-              <span style={S.label}>Días cerrados fijos</span>
-              <div style={S.cerradosChipRow}>
-                {DIAS_SEMANA.map((w, i) => {
-                  const wd = JS_WEEKDAY_DE_INDICE[i];
-                  const activo = (local.diasCerrados || []).includes(wd);
-                  return (
-                    <button
-                      key={i}
-                      onClick={() => toggleDiaCerrado(wd)}
-                      style={activo ? S.cerradoChipActivo : S.cerradoChip}
-                    >{w}</button>
-                  );
-                })}
-              </div>
+            {/* Cosas que se configuran una vez y casi no se tocan: quedan plegadas para no
+                ocuparle lugar todos los días a lo que sí se usa seguido (vendedores, calendario). */}
+            <button
+              onClick={() => setConfigAbierta((o) => !o)}
+              style={S.configToggleBtn}
+              aria-expanded={configAbierta}
+            >
+              <span>Configuración del local</span>
+              <ChevronDown
+                size={15}
+                style={{ transform: configAbierta ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}
+              />
+            </button>
 
-              <span style={{ ...S.label, marginTop: 10, display: "block" }}>Feriados / fechas puntuales cerradas</span>
-              <FeriadoPicker onAgregar={agregarFechaCerrada} />
-              {(local.fechasCerradas || []).length > 0 && (
-                <div style={S.feriadoList}>
-                  {[...(local.fechasCerradas || [])].sort().map((f) => (
-                    <span key={f} style={S.feriadoChip}>
-                      {fmtFechaCorta(f)}
-                      <button onClick={() => quitarFechaCerrada(f)} style={S.feriadoRemove}>×</button>
-                    </span>
-                  ))}
+            {configAbierta && (
+              <>
+                <div style={{ ...S.twoCol, marginTop: 10 }}>
+                  <label style={S.field}>
+                    <span style={S.label}>Local abre desde</span>
+                    <select
+                      value={local.horaInicio}
+                      onChange={(e) => updateLocal({ horaInicio: e.target.value })}
+                      style={S.input}
+                    >
+                      {generarOpcionesHora("00:00", "23:30").map((h) => (
+                        <option key={h} value={h}>{h}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label style={S.field}>
+                    <span style={S.label}>Hasta</span>
+                    <select
+                      value={local.horaFin}
+                      onChange={(e) => updateLocal({ horaFin: e.target.value })}
+                      style={S.input}
+                    >
+                      {generarOpcionesHora("00:00", "23:30").map((h) => (
+                        <option key={h} value={h}>{h}</option>
+                      ))}
+                    </select>
+                  </label>
                 </div>
-              )}
-            </div>
+
+                <div style={S.cerradosBlock}>
+                  <span style={S.label}>Días cerrados fijos</span>
+                  <div style={S.cerradosChipRow}>
+                    {DIAS_SEMANA.map((w, i) => {
+                      const wd = JS_WEEKDAY_DE_INDICE[i];
+                      const activo = (local.diasCerrados || []).includes(wd);
+                      return (
+                        <button
+                          key={i}
+                          onClick={() => toggleDiaCerrado(wd)}
+                          style={activo ? S.cerradoChipActivo : S.cerradoChip}
+                        >{w}</button>
+                      );
+                    })}
+                  </div>
+
+                  <span style={{ ...S.label, marginTop: 10, display: "block" }}>Feriados / fechas puntuales cerradas</span>
+                  <FeriadoPicker onAgregar={agregarFechaCerrada} />
+                  {(local.fechasCerradas || []).length > 0 && (
+                    <div style={S.feriadoList}>
+                      {[...(local.fechasCerradas || [])].sort().map((f) => (
+                        <span key={f} style={S.feriadoChip}>
+                          {fmtFechaCorta(f)}
+                          <button onClick={() => quitarFechaCerrada(f)} style={S.feriadoRemove}>×</button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
           </div>
 
           <div style={S.card}>
@@ -1118,7 +1131,6 @@ function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, lo
     const cerrado = estaCerrado(local, year, month, d);
     const feriado = feriados[key];
     const entradas = vendedores
-      .filter((v) => v.modo === "calendario")
       .map((v) => ({ v, dia: v.dias[key] }))
       .filter((x) => x.dia && x.dia.turnos && x.dia.turnos.length > 0);
     const visibles = entradas.slice(0, 4);
@@ -1251,7 +1263,7 @@ function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFech
               const key = dateKey(y, m, d);
               const cerrado = estaCerrado(local, y, m, d);
               const eventos = [];
-              vendedores.filter((v) => v.modo === "calendario").forEach((v) => {
+              vendedores.forEach((v) => {
                 (v.dias[key]?.turnos || []).forEach((t, idx) => {
                   eventos.push({
                     vId: v.id, nombre: v.nombre, color: v.color, idx,
@@ -1345,41 +1357,13 @@ function VendedorEditor({ v, prefix, onChange, onCopiarMesAnterior, onRepetirSem
         )}
       </div>
 
-      <div style={S.modeRow}>
-        <button
-          onClick={() => onChange({ modo: "calendario" })}
-          style={v.modo === "calendario" ? S.modeBtnActive : S.modeBtn}
-        >Calendario</button>
-        <button
-          onClick={() => onChange({ modo: "patron" })}
-          style={v.modo === "patron" ? S.modeBtnActive : S.modeBtn}
-        >Patrón rápido</button>
+      <div style={S.miniStat}>{diasMarcados} días marcados · {fmt(horasCalc, 1)} hs este mes</div>
+      <div style={S.rowBetween3}>
+        <button onClick={handleCopiar} style={S.copyBtn}>Copiar mes anterior</button>
+        <button onClick={handleRepetir} style={S.copyBtn}>Repetir 1ª semana</button>
+        <button onClick={handleCopiarSemana} style={S.copyBtn}>Copiar semana anterior</button>
       </div>
-
-      {v.modo === "calendario" ? (
-        <>
-          <div style={S.miniStat}>{diasMarcados} días marcados · {fmt(horasCalc, 1)} hs este mes</div>
-          <div style={S.rowBetween3}>
-            <button onClick={handleCopiar} style={S.copyBtn}>Copiar mes anterior</button>
-            <button onClick={handleRepetir} style={S.copyBtn}>Repetir 1ª semana</button>
-            <button onClick={handleCopiarSemana} style={S.copyBtn}>Copiar semana anterior</button>
-          </div>
-          {msg && <div style={S.copiadoMsg}>{msg}</div>}
-        </>
-      ) : (
-        <div style={S.twoCol}>
-          <label style={S.field}>
-            <span style={S.label}>Días por semana</span>
-            <input type="number" min="0" max="7" value={v.diasSemana}
-              onChange={(e) => onChange({ diasSemana: e.target.value })} style={S.input} />
-          </label>
-          <label style={S.field}>
-            <span style={S.label}>Horas por día</span>
-            <input type="number" min="0" step="0.5" value={v.horasDiaPatron}
-              onChange={(e) => onChange({ horasDiaPatron: e.target.value })} style={S.input} />
-          </label>
-        </div>
-      )}
+      {msg && <div style={S.copiadoMsg}>{msg}</div>}
     </div>
   );
 }
@@ -1420,9 +1404,8 @@ function TurnoEditorCard({ vendedor, vendedores, local, fecha, onCambiarFecha, o
 
       {fecha && (() => {
         const key = dateKey(fecha.year, fecha.month, fecha.day);
-        const calendario = vendedores.filter((v) => v.modo === "calendario");
-        const conHorario = calendario.filter((v) => v.dias[key]?.turnos?.length);
-        const sinHorario = calendario.filter((v) => !v.dias[key]?.turnos?.length);
+        const conHorario = vendedores.filter((v) => v.dias[key]?.turnos?.length);
+        const sinHorario = vendedores.filter((v) => !v.dias[key]?.turnos?.length);
         if (conHorario.length === 0 && sinHorario.length === 0) return null;
         return (
           <div style={S.diaResumenBlock}>
@@ -1460,9 +1443,7 @@ function TurnoEditorCard({ vendedor, vendedores, local, fecha, onCambiarFecha, o
         </div>
       )}
 
-      {vendedor.modo !== "calendario" ? (
-        <div style={S.note}>Este vendedor usa "Patrón rápido" — su horario no se carga por calendario.</div>
-      ) : !fecha ? (
+      {!fecha ? (
         <div style={S.notePlain}>Tocá un día en el calendario para cargar su horario.</div>
       ) : (
         <TurnoEditorDia
@@ -1730,15 +1711,6 @@ const S = {
   legendRow: { display: "flex", flexWrap: "wrap", gap: 10, marginTop: 12, paddingTop: 10, borderTop: `1px solid ${LINE}` },
   legendChip: { display: "flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 600, color: SUB },
   legendDot: { width: 8, height: 8, borderRadius: 99, flexShrink: 0, display: "inline-block" },
-  modeRow: { display: "flex", gap: 6, marginBottom: 10 },
-  modeBtn: {
-    flex: 1, fontSize: 12, fontWeight: 600, color: SUB, background: SURFACE_2, border: "none",
-    borderRadius: 9, padding: "7px 0", cursor: "pointer",
-  },
-  modeBtnActive: {
-    flex: 1, fontSize: 12, fontWeight: 700, color: "#fff", background: ACCENT, border: "none",
-    borderRadius: 9, padding: "7px 0", cursor: "pointer",
-  },
   rowBetween3: { display: "flex", alignItems: "center", gap: 8, marginTop: 8, flexWrap: "wrap" },
   copyBtn: {
     fontSize: 11, fontWeight: 700, color: ACCENT, background: ACCENT_SOFT, border: "none",
@@ -1788,6 +1760,12 @@ const S = {
   },
   miniStatStrong: { fontSize: 12.5, fontWeight: 800, color: INK },
   cerradosBlock: { marginTop: 12, paddingTop: 12, borderTop: `1px solid ${LINE}` },
+  configToggleBtn: {
+    width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
+    marginTop: 12, paddingTop: 12, paddingBottom: 2,
+    borderWidth: 0, borderTopWidth: 1, borderTopStyle: "solid", borderTopColor: LINE,
+    background: "transparent", cursor: "pointer", color: SUB, fontSize: 12.5, fontWeight: 700,
+  },
   cerradosChipRow: { display: "flex", gap: 5, marginTop: 6 },
   cerradoChip: {
     width: 30, height: 30, borderRadius: 8, border: `1px solid ${LINE}`, background: SURFACE_INPUT,
