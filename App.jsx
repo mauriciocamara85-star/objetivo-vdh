@@ -13,7 +13,7 @@ const STORAGE_KEY = "vdh-objetivo-calendario"; // fallback localStorage (sin cap
 const UI_PREFS_KEY = "vdh-objetivo-ui-prefs"; // preferencias locales de navegación (no se comparten)
 const TEMA_KEY = "vdh-objetivo-tema";
 const DB_DOC_PATH = "app/data"; // documento compartido cuando la capacidad "db" está disponible
-const DATA_VERSION = 2;
+const DATA_VERSION = 3;
 const DIAS_SEMANA = ["L", "M", "M", "J", "V", "S", "D"];
 const DIAS_SEMANA_LARGO = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
 // Convierte el índice de DIAS_SEMANA (0=Lun...6=Dom) al valor que devuelve Date.getDay() (0=Dom...6=Sab).
@@ -26,26 +26,50 @@ const MESES_CORTO = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct"
 
 // Paleta prolija y fija para identificar vendedores en el calendario compartido.
 // Se asigna en orden a medida que se agregan vendedores (no es elegible a mano).
-// El teal queda último a propósito: es el mismo color que el acento de toda la interfaz
-// (botones activos, "Hoy", "Guardado"), así que se reserva como último recurso para que un
-// vendedor no termine con turnos del mismo color que los resaltados de la app.
+// Mismos tonos que usa Google Calendar para los eventos (Flamingo, Tangerine, Sage, Peacock,
+// Grape, Blueberry, Basil, Tomato, Graphite). El teal queda último a propósito: es el mismo
+// color que el acento de toda la interfaz (botones activos, "Hoy", "Guardado"), así que se
+// reserva como último recurso para que un vendedor no termine con turnos de ese color.
 const PALETA_VENDEDORES = [
-  "#A97A66", // terracota
-  "#6C7BA0", // azul grisáceo
-  "#B08D3E", // mostaza
-  "#5E8C61", // verde salvia
-  "#8B5F8C", // ciruela
-  "#4C8C97", // turquesa
-  "#B0654F", // ladrillo
-  "#7A8C4C", // oliva
-  "#5F6C8C", // índigo suave
+  "#E67C73", // flamingo
+  "#F4511E", // tangerine
+  "#33B679", // sage
+  "#039BE5", // peacock
+  "#8E24AA", // grape
+  "#3F51B5", // blueberry
+  "#0B8043", // basil
+  "#D50000", // tomato
+  "#616161", // graphite
   "#2C6E71", // teal (acento) — reservado, último recurso
 ];
+// Paleta anterior (antes de pasar a los tonos de Calendar), en el mismo orden que tenía. Sirve
+// solo para la migración de datos viejos: a un vendedor que ya tenía uno de estos colores
+// guardado se le asigna el color de Calendar que está en la misma posición, en vez de dejarlo
+// con el tono viejo para siempre.
+const PALETA_VENDEDORES_ANTERIOR = [
+  "#A97A66", "#6C7BA0", "#B08D3E", "#5E8C61", "#8B5F8C",
+  "#4C8C97", "#B0654F", "#7A8C4C", "#5F6C8C", "#2C6E71",
+];
+
+// Elige texto blanco o gris oscuro según qué tan clara sea la franja de color de fondo (misma
+// idea que usa Calendar: sobre colores claros como el flamingo el texto queda oscuro, sobre los
+// más saturados queda blanco), para que el nombre del vendedor siempre se lea bien.
+function colorTextoContraste(hex) {
+  const c = (hex || "").replace("#", "");
+  if (c.length !== 6) return "#fff";
+  const r = parseInt(c.slice(0, 2), 16), g = parseInt(c.slice(2, 4), 16), b = parseInt(c.slice(4, 6), 16);
+  const luminancia = (r * 299 + g * 587 + b * 114) / 1000;
+  return luminancia >= 150 ? "#2B2B2B" : "#fff";
+}
 const COLOR_RESERVADO_ACENTO = PALETA_VENDEDORES[PALETA_VENDEDORES.length - 1];
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 const pad2 = (n) => String(n).padStart(2, "0");
 const dateKey = (y, m, d) => `${y}-${pad2(m)}-${pad2(d)}`;
+const fechaDeKey = (key) => {
+  const [y, m, d] = key.split("-").map(Number);
+  return { year: y, month: m, day: d };
+};
 const monthPrefix = (y, m) => `${y}-${pad2(m)}`;
 
 function daysInMonth(y, m) {
@@ -319,13 +343,19 @@ function defaultSharedData() {
   };
 }
 
-// Migra datos guardados con el formato viejo (día -> horas) al nuevo formato
-// (día -> turnos con horario). Decisión: empezar de cero en los días cargados,
-// se conserva todo lo demás (locales, vendedores, objetivos).
+// Migra datos guardados con el formato viejo (día -> horas) al nuevo formato (día -> turnos con
+// horario, desde la v2). Decisión: empezar de cero en los días cargados, se conserva todo lo
+// demás (locales, vendedores, objetivos). Ojo: se compara contra 2 a propósito, NO contra
+// DATA_VERSION — si no, cada vez que suba DATA_VERSION por cualquier otro motivo (como pasó al
+// sumar la migración de colores de acá abajo) se volverían a borrar todos los turnos cargados.
 function migrarDatos(parsed) {
   if (!parsed || !parsed.locales) return defaultSharedData();
+  const formatoTurnosYaMigrado = (parsed.version || 0) >= 2;
+  // Antes de la v3 los colores de vendedor eran de la paleta vieja (terracota, azul grisáceo,
+  // etc.); a quien ya tenía uno de esos guardado se lo pasa al tono de Calendar de la misma
+  // posición, para que el cambio de paleta se note también en los vendedores ya cargados.
+  const veniaDeAntesDePaletaCalendar = (parsed.version || 0) < 3;
   const locales = parsed.locales.map((l) => {
-    const yaEsV2 = parsed.version === DATA_VERSION;
     return {
       ...l,
       horaInicio: l.horaInicio || "08:00",
@@ -333,11 +363,14 @@ function migrarDatos(parsed) {
       diasCerrados: l.diasCerrados || [],
       fechasCerradas: l.fechasCerradas || [],
       vendedores: dedupeColoresVendedores(
-        l.vendedores.map((v, idx) => ({
-          ...v,
-          color: v.color || PALETA_VENDEDORES[idx % PALETA_VENDEDORES.length],
-          dias: yaEsV2 ? v.dias || {} : {},
-        }))
+        l.vendedores.map((v, idx) => {
+          let color = v.color || PALETA_VENDEDORES[idx % PALETA_VENDEDORES.length];
+          if (veniaDeAntesDePaletaCalendar) {
+            const iAnterior = PALETA_VENDEDORES_ANTERIOR.indexOf(color);
+            if (iAnterior !== -1) color = PALETA_VENDEDORES[iAnterior];
+          }
+          return { ...v, color, dias: formatoTurnosYaMigrado ? v.dias || {} : {} };
+        })
       ),
     };
   });
@@ -428,7 +461,19 @@ export default function App() {
   const [configAbierta, setConfigAbierta] = useState(false); // acordeón de "Configuración del local"
   // Portapapeles de "copiar día": todos los turnos de todos los vendedores de un día puntual,
   // para pegarlos en otro. Vive solo en esta pestaña, no se persiste.
-  const [diaCopiado, setDiaCopiado] = useState(null); // { localId, fecha, porVendedor } | null
+  const [diaCopiado, setDiaCopiado] = useState(null); // { localId, dias: [{offsetDias, porVendedor}] } | null
+  // Días marcados con Ctrl/Cmd+clic en el calendario para copiarlos todos juntos ("YYYY-MM-DD").
+  // Se vacía solo al copiar, o al cambiar de local (los días de otro local no tienen sentido acá).
+  const [diasParaCopiar, setDiasParaCopiar] = useState(() => new Set());
+  const toggleDiaParaCopiar = (fecha) => {
+    const key = dateKey(fecha.year, fecha.month, fecha.day);
+    setDiasParaCopiar((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
   const [vista, setVista] = useState("mes"); // "mes" | "semana" | "dia"
   const [semanaInicio, setSemanaInicio] = useState(() => lunesDeLaSemana(now));
   const [tema, setTema] = useState(() => {
@@ -663,6 +708,7 @@ export default function App() {
     setLocalActivoId(l.id);
     setVendedorActivo(l.vendedores[0]?.id || null);
     setFechaSeleccionada(null);
+    setDiasParaCopiar(new Set());
   };
   const removeLocal = (lid) => {
     if (sharedData.locales.length <= 1) return;
@@ -738,27 +784,46 @@ export default function App() {
     updateVendedor(v.id, { dias });
   };
 
-  // Copiar/pegar un día completo: junta los turnos de TODOS los vendedores del local en esa
-  // fecha (guardado en memoria, no se persiste) y los pega en otra fecha, reemplazando lo que
-  // esos mismos vendedores ya tuvieran cargado ahí. A los vendedores que no trabajaban el día
-  // copiado no se los toca.
-  const copiarDia = (fecha) => {
-    const key = dateKey(fecha.year, fecha.month, fecha.day);
-    const porVendedor = {};
-    local.vendedores.forEach((v) => {
-      const turnos = v.dias[key]?.turnos;
-      if (turnos && turnos.length) porVendedor[v.id] = turnos.map((t) => ({ ...t }));
+  // Copiar/pegar uno o varios días: junta los turnos de TODOS los vendedores del local en cada
+  // fecha elegida (guardado en memoria, no se persiste) y los pega en otro lado, reemplazando lo
+  // que esos mismos vendedores ya tuvieran cargado en el día correspondiente. A los vendedores
+  // que no trabajaban un día copiado no se los toca. Si se copian varios días, se guarda la
+  // distancia en días de cada uno respecto del más antiguo, para poder "pegarlos" manteniendo la
+  // misma separación entre ellos a partir de la fecha donde se pegue (ej. copiás lunes+viernes,
+  // se pegan igual de separados en la semana que elijas).
+  const copiarDias = (fechas) => {
+    if (!fechas || fechas.length === 0) return;
+    const ordenadas = [...fechas].sort(
+      (a, b) => new Date(a.year, a.month - 1, a.day) - new Date(b.year, b.month - 1, b.day)
+    );
+    const base = new Date(ordenadas[0].year, ordenadas[0].month - 1, ordenadas[0].day);
+    const dias = ordenadas.map((f) => {
+      const key = dateKey(f.year, f.month, f.day);
+      const offsetDias = Math.round((new Date(f.year, f.month - 1, f.day) - base) / 86400000);
+      const porVendedor = {};
+      local.vendedores.forEach((v) => {
+        const turnos = v.dias[key]?.turnos;
+        if (turnos && turnos.length) porVendedor[v.id] = turnos.map((t) => ({ ...t }));
+      });
+      return { offsetDias, porVendedor };
     });
-    setDiaCopiado({ localId: local.id, fecha, porVendedor });
+    setDiaCopiado({ localId: local.id, dias });
   };
 
-  const pegarDia = (fecha) => {
-    if (!diaCopiado || diaCopiado.localId !== local.id) return 0;
-    const key = dateKey(fecha.year, fecha.month, fecha.day);
-    const idsConCopia = Object.keys(diaCopiado.porVendedor).filter((vid) =>
-      local.vendedores.some((v) => v.id === vid)
-    );
-    if (idsConCopia.length === 0) return 0;
+  const pegarDias = (fecha) => {
+    if (!diaCopiado || diaCopiado.localId !== local.id || !fecha) return 0;
+    const anchor = new Date(fecha.year, fecha.month - 1, fecha.day);
+    const porDia = diaCopiado.dias
+      .map(({ offsetDias, porVendedor }) => {
+        const destino = new Date(anchor);
+        destino.setDate(destino.getDate() + offsetDias);
+        const key = dateKey(destino.getFullYear(), destino.getMonth() + 1, destino.getDate());
+        const entradas = Object.entries(porVendedor).filter(([vid]) => local.vendedores.some((v) => v.id === vid));
+        return { key, entradas };
+      })
+      .filter((d) => d.entradas.length > 0);
+    if (porDia.length === 0) return 0;
+
     pushUndo({ tipo: "local", localId: local.id, localAnterior: local });
     setSharedData((d) => ({
       ...d,
@@ -767,14 +832,19 @@ export default function App() {
         return {
           ...l,
           vendedores: l.vendedores.map((v) => {
-            const turnos = diaCopiado.porVendedor[v.id];
-            if (!turnos) return v;
-            return { ...v, dias: { ...v.dias, [key]: { turnos: turnos.map((t) => ({ ...t })) } } };
+            const propias = porDia.filter(({ entradas }) => entradas.some(([vid]) => vid === v.id));
+            if (propias.length === 0) return v;
+            const dias = { ...v.dias };
+            propias.forEach(({ key, entradas }) => {
+              const [, turnos] = entradas.find(([vid]) => vid === v.id);
+              dias[key] = { turnos: turnos.map((t) => ({ ...t })) };
+            });
+            return { ...v, dias };
           }),
         };
       }),
     }));
-    return idsConCopia.length;
+    return porDia.length; // cantidad de días efectivamente pegados
   };
 
   const copiarMesAnteriorVendedor = (v) => {
@@ -1089,7 +1159,7 @@ export default function App() {
                 <button
                   key={v.id}
                   onClick={() => setVendedorActivo(v.id)}
-                  style={v.id === vActivo?.id ? { ...S.chipActiveAccent, background: v.color } : S.chip}
+                  style={v.id === vActivo?.id ? { ...S.chipActiveAccent, background: v.color, color: colorTextoContraste(v.color) } : S.chip}
                 >
                   <span style={{ ...S.chipDot, background: v.color }} />
                   {v.nombre || "Sin nombre"}
@@ -1122,6 +1192,7 @@ export default function App() {
                 <div style={S.sectionTitle}>Calendario de horarios</div>
                 <div style={S.miniStat}>
                   {vista === "mes" ? "Tocá un día para cargar el horario del vendedor seleccionado" : "Tocá un turno para editarlo, o el espacio vacío para elegir el día"}
+                  {" · Ctrl+clic (o Cmd+clic) en varios días para copiarlos juntos"}
                 </div>
               </div>
               <div style={S.vistaSwitchRow}>
@@ -1138,6 +1209,8 @@ export default function App() {
                   local={local}
                   fechaSeleccionada={fechaSeleccionada}
                   onSelectFecha={setFechaSeleccionada}
+                  diasParaCopiar={diasParaCopiar}
+                  onToggleDiaParaCopiar={toggleDiaParaCopiar}
                 />
               ) : (
                 <GrillaSemana
@@ -1147,6 +1220,8 @@ export default function App() {
                   fechaSeleccionada={fechaSeleccionada}
                   onSelectFecha={setFechaSeleccionada}
                   onSelectVendedor={setVendedorActivo}
+                  diasParaCopiar={diasParaCopiar}
+                  onToggleDiaParaCopiar={toggleDiaParaCopiar}
                 />
               )}
             </div>
@@ -1181,11 +1256,19 @@ export default function App() {
             onQuitarDia={() => quitarDiaVendedor(vActivo, fechaSeleccionada)}
             copiaDisponible={
               diaCopiado && diaCopiado.localId === local.id
-                ? { fechaTexto: `${diaCopiado.fecha.day}/${diaCopiado.fecha.month}`, cantidad: Object.keys(diaCopiado.porVendedor).length }
+                ? { cantidadDias: diaCopiado.dias.length }
                 : null
             }
-            onCopiarDia={() => copiarDia(fechaSeleccionada)}
-            onPegarDia={() => pegarDia(fechaSeleccionada)}
+            diasSeleccionadosParaCopiar={diasParaCopiar.size}
+            onCopiarDia={() => {
+              const fechas = diasParaCopiar.size > 0
+                ? [...diasParaCopiar].map(fechaDeKey)
+                : (fechaSeleccionada ? [fechaSeleccionada] : []);
+              copiarDias(fechas);
+              setDiasParaCopiar(new Set());
+            }}
+            onLimpiarSeleccion={() => setDiasParaCopiar(new Set())}
+            onPegarDia={() => pegarDias(fechaSeleccionada)}
           />
 
           <div style={S.card}>
@@ -1309,7 +1392,7 @@ function HorarioEspecialPicker({ local, onAgregar }) {
 // Calendario mensual: para TODOS los vendedores del local, un resumen compacto de los turnos
 // cargados cada día (nombre + horario, con una tira fina proporcional al horario del local
 // debajo). Marca el día actual, los días cerrados (fijos o feriados) y los huecos de cobertura.
-function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, local, fechaSeleccionada, onSelectFecha }) {
+function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, local, fechaSeleccionada, onSelectFecha, diasParaCopiar, onToggleDiaParaCopiar }) {
   const feriados = feriadosArgentina(year);
   const cells = [];
   for (let i = 0; i < leadBlanks; i++) cells.push(<div key={"b" + i} />);
@@ -1331,13 +1414,24 @@ function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, lo
     if (seleccionado) cellStyle = S.dayCellSelected;
     else if (cerrado) cellStyle = S.dayCellCerrado;
     else if (hoy) cellStyle = S.dayCellHoy;
+    const marcadoParaCopiar = diasParaCopiar && diasParaCopiar.has(key);
+    if (marcadoParaCopiar) cellStyle = { ...cellStyle, ...S.diaMarcadoParaCopiar };
 
     cells.push(
-      <button key={d} onClick={() => onSelectFecha({ year, month, day: d })} style={cellStyle} title={feriado || undefined}>
+      <button
+        key={d}
+        onClick={(e) => {
+          if (e.ctrlKey || e.metaKey) onToggleDiaParaCopiar({ year, month, day: d });
+          else onSelectFecha({ year, month, day: d });
+        }}
+        style={cellStyle}
+        title={feriado || undefined}
+      >
         <span style={cerrado ? S.dayNumRowCerrado : hoy ? S.dayNumRowHoy : S.dayNumRow}>
           {d}
           {feriado && <span style={S.feriadoDot} />}
           {tieneHueco && <span style={S.gapDot} />}
+          {marcadoParaCopiar && <span style={S.multicopiaCheck}>✓</span>}
         </span>
         {cerrado && visibles.length === 0 && <span style={S.cerradoLabel}>Cerrado</span>}
         {!cerrado && feriado && visibles.length === 0 && <span style={S.feriadoLabel}>{feriado}</span>}
@@ -1371,7 +1465,7 @@ function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, lo
 
 // Vista semana/día: grilla horaria estilo Google Calendar. Cada turno se dibuja en su posición
 // y duración reales; si varios vendedores se solapan, se acomodan en columnas lado a lado.
-function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFecha, onSelectVendedor }) {
+function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFecha, onSelectVendedor, diasParaCopiar, onToggleDiaParaCopiar }) {
   const feriadosPorAnio = {};
   const getFeriados = (y) => feriadosPorAnio[y] || (feriadosPorAnio[y] = feriadosArgentina(y));
 
@@ -1427,10 +1521,22 @@ function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFech
               let estilo = S.semanaDiaHeader;
               if (sel) estilo = S.semanaDiaHeaderSel;
               else if (hoy) estilo = S.semanaDiaHeaderHoy;
+              const marcadoParaCopiar = diasParaCopiar && diasParaCopiar.has(key);
+              if (marcadoParaCopiar) estilo = { ...estilo, ...S.diaMarcadoParaCopiar };
               return (
-                <button key={i} onClick={() => onSelectFecha({ year: y, month: m, day: d })} style={estilo} title={feriado || undefined}>
+                <button
+                  key={i}
+                  onClick={(e) => {
+                    if (e.ctrlKey || e.metaKey) onToggleDiaParaCopiar({ year: y, month: m, day: d });
+                    else onSelectFecha({ year: y, month: m, day: d });
+                  }}
+                  style={estilo}
+                  title={feriado || undefined}
+                >
                   <span style={S.semanaDiaHeaderNombre}>{DIAS_SEMANA_LARGO[fecha.getDay()].slice(0, 3)}</span>
-                  <span style={S.semanaDiaHeaderNum}>{d}{feriado && <span style={S.feriadoDot} />}</span>
+                  <span style={S.semanaDiaHeaderNum}>
+                    {d}{feriado && <span style={S.feriadoDot} />}{marcadoParaCopiar && <span style={S.multicopiaCheck}>✓</span>}
+                  </span>
                 </button>
               );
             })}
@@ -1491,11 +1597,11 @@ function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFech
                       <button
                         key={ev.vId + "-" + ev.idx}
                         onClick={(e) => { e.stopPropagation(); onSelectFecha({ year: y, month: m, day: d }); onSelectVendedor(ev.vId); }}
-                        style={{ ...S.semanaEvento, top, height: alto, left: `${left}%`, width: `calc(${ancho}% - 3px)`, background: ev.color }}
+                        style={{ ...S.semanaEvento, top, height: alto, left: `${left}%`, width: `calc(${ancho}% - 3px)`, background: ev.color, color: colorTextoContraste(ev.color) }}
                         title={`${ev.nombre || "Sin nombre"}: ${fmtHoraCorta(minAHHMM(ev.inicioMin))}-${fmtHoraCorta(minAHHMM(ev.finMin))}`}
                       >
                         <span style={S.semanaEventoNombre}>{ev.nombre || "Sin nombre"}</span>
-                        {alto >= 34 && (
+                        {alto >= 38 && (
                           <span style={S.semanaEventoHora}>{fmtHoraCorta(minAHHMM(ev.inicioMin))}–{fmtHoraCorta(minAHHMM(ev.finMin))}</span>
                         )}
                       </button>
@@ -1558,10 +1664,15 @@ function VendedorEditor({ v, prefix, onChange, onCopiarMesAnterior, onRepetirSem
 
 // Panel de edición del horario del vendedor seleccionado, para la fecha elegida en el calendario.
 // El aviso de huecos y el resumen del día consideran a TODOS los vendedores, no solo al activo.
-function TurnoEditorCard({ vendedor, vendedores, local, fecha, onCambiarFecha, onSetTurnos, onQuitarDia, copiaDisponible, onCopiarDia, onPegarDia }) {
+function TurnoEditorCard({
+  vendedor, vendedores, local, fecha, onCambiarFecha, onSetTurnos, onQuitarDia,
+  copiaDisponible, diasSeleccionadosParaCopiar, onCopiarDia, onLimpiarSeleccion, onPegarDia,
+}) {
   if (!vendedor) return null;
 
   const [msgDia, setMsgDia] = useState("");
+  const haySeleccionMultiple = diasSeleccionadosParaCopiar > 0;
+  const mostrarBotonesCopiar = !!fecha || haySeleccionMultiple;
 
   const cambiarDia = (delta) => {
     const base = fecha || hoyComoFecha();
@@ -1570,13 +1681,14 @@ function TurnoEditorCard({ vendedor, vendedores, local, fecha, onCambiarFecha, o
   };
 
   const handleCopiarDia = () => {
+    const cantidad = haySeleccionMultiple ? diasSeleccionadosParaCopiar : 1;
     onCopiarDia();
-    setMsgDia("Día copiado");
+    setMsgDia(cantidad === 1 ? "Día copiado" : `${cantidad} días copiados`);
     setTimeout(() => setMsgDia(""), 2000);
   };
   const handlePegarDia = () => {
     const n = onPegarDia();
-    setMsgDia(n > 0 ? `Se pegó el horario de ${n} vendedor${n === 1 ? "" : "es"}` : "No hay nada copiado para pegar");
+    setMsgDia(n > 0 ? (n === 1 ? "Se pegó 1 día" : `Se pegaron ${n} días`) : "No hay nada copiado para pegar");
     setTimeout(() => setMsgDia(""), 2500);
   };
 
@@ -1604,18 +1716,30 @@ function TurnoEditorCard({ vendedor, vendedores, local, fecha, onCambiarFecha, o
         )}
       </div>
 
-      {fecha && (
+      {mostrarBotonesCopiar && (
         <>
           <div style={S.rowBetween3}>
-            <button onClick={handleCopiarDia} style={S.copyBtn}>Copiar este día</button>
+            <button onClick={handleCopiarDia} style={S.copyBtn}>
+              {haySeleccionMultiple ? `Copiar ${diasSeleccionadosParaCopiar} días seleccionados` : "Copiar este día"}
+            </button>
+            {haySeleccionMultiple && (
+              <button onClick={onLimpiarSeleccion} style={S.copyBtnDisabled} title="Cancelar la selección de días">✕</button>
+            )}
             <button
               onClick={handlePegarDia}
-              disabled={!copiaDisponible}
-              style={copiaDisponible ? S.copyBtn : S.copyBtnDisabled}
+              disabled={!copiaDisponible || !fecha}
+              style={copiaDisponible && fecha ? S.copyBtn : S.copyBtnDisabled}
             >
-              Pegar día copiado{copiaDisponible ? ` (${copiaDisponible.fechaTexto} · ${copiaDisponible.cantidad})` : ""}
+              {copiaDisponible
+                ? `Pegar ${copiaDisponible.cantidadDias === 1 ? "el día copiado" : `los ${copiaDisponible.cantidadDias} días copiados`}`
+                : "Pegar día copiado"}
             </button>
           </div>
+          {haySeleccionMultiple && (
+            <div style={S.notePlainSinMargen}>
+              Elegí más días con Ctrl+clic (o Cmd+clic), o tocá "Copiar" para juntarlos ya.
+            </div>
+          )}
           {msgDia && <div style={S.copiadoMsg}>{msgDia}</div>}
         </>
       )}
@@ -1764,7 +1888,9 @@ const SURFACE_INPUT = "var(--surface-input)";
 const S = {
   page: {
     minHeight: "100vh", background: BG, color: INK,
-    fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif",
+    // Roboto es la que usa Google Calendar/Workspace en la web; si por lo que sea no llega a
+    // cargar (sin internet, bloqueada), cae en la misma pila de fuentes del sistema de antes.
+    fontFamily: "'Roboto', -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif",
     padding: "24px 20px 48px", maxWidth: 1460, margin: "0 auto",
   },
   loadingWrap: { minHeight: "100vh", background: BG, display: "flex", alignItems: "center", justifyContent: "center" },
@@ -1931,6 +2057,13 @@ const S = {
   },
   moreBadge: { fontSize: 8, fontWeight: 700, color: SUB, padding: "0 3px" },
   gapDot: { width: 5, height: 5, borderRadius: 99, background: WARN, flexShrink: 0, display: "inline-block" },
+  // Días marcados con Ctrl/Cmd+clic para copiarlos juntos: un aro de color aparte (no pisa el
+  // borde de "seleccionado" ni el tamaño de la celda, va por afuera con boxShadow).
+  diaMarcadoParaCopiar: { boxShadow: "0 0 0 2px var(--multicopia) inset" },
+  multicopiaCheck: {
+    display: "inline-flex", alignItems: "center", justifyContent: "center", width: 12, height: 12,
+    borderRadius: 99, background: "var(--multicopia)", color: "#fff", fontSize: 8, fontWeight: 800, lineHeight: 1,
+  },
   gapWarning: {
     fontSize: 11.5, fontWeight: 600, color: WARN, background: WARN_BG, borderRadius: 9,
     padding: "8px 10px", marginBottom: 10, lineHeight: 1.4,
@@ -2049,11 +2182,13 @@ const S = {
     cursor: "pointer", overflow: "hidden", textAlign: "left", display: "flex", flexDirection: "column",
     boxSizing: "border-box",
   },
-  semanaEventoNombre: { fontSize: 10.5, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
-  semanaEventoHora: { fontSize: 9, fontWeight: 600, opacity: 0.9 },
+  semanaEventoNombre: { fontSize: 12, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  semanaEventoHora: { fontSize: 10.5, fontWeight: 600, opacity: 0.9 },
 };
 
 const CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700;800&display=swap');
+
   .vdhApp {
     --accent: #2C6E71;
     --accent-soft: #E3EFEE;
@@ -2070,6 +2205,7 @@ const CSS = `
     --surface-2: #F5F5F7;
     --surface-input: #FAFAFB;
     --feriado: #8B6FB0;
+    --multicopia: #4A5FD9;
   }
   .vdhApp[data-theme="dark"] {
     --accent: #4FA6A6;
@@ -2087,6 +2223,7 @@ const CSS = `
     --surface-2: #242B2D;
     --surface-input: #1B2224;
     --feriado: #C7A6E8;
+    --multicopia: #8B9BFF;
   }
 
   * { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
