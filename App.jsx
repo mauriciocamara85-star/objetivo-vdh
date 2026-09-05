@@ -372,12 +372,53 @@ export default function App() {
   const [saved, setSaved] = useState(false);
   const [syncMode, setSyncMode] = useState("local"); // "db" | "local"
 
+  // Deshacer: antes de cada cambio que hace la persona en este dispositivo (no lo que llega
+  // sincronizado de otro dispositivo) se guarda cómo estaba ANTES la parte puntual que se tocó
+  // (un local completo, o qué local se agregó/borró) — nunca el documento entero. Así, deshacer
+  // un cambio hecho en el local "Rivadavia" nunca pisa lo que otra persona esté cargando al mismo
+  // tiempo en, por ejemplo, "San Justo": ese otro local ni se toca. Vive solo en esta pestaña —
+  // no se persiste ni se sincroniza.
+  const undoStack = useRef([]);
+  const UNDO_MAX = 25;
+  const [hayDeshacer, setHayDeshacer] = useState(false);
+  const pushUndo = (accion) => {
+    undoStack.current.push(accion);
+    if (undoStack.current.length > UNDO_MAX) undoStack.current.shift();
+    setHayDeshacer(true);
+  };
+  const deshacer = () => {
+    const accion = undoStack.current.pop();
+    if (!accion) return;
+    setSharedData((d) => {
+      if (accion.tipo === "local") {
+        // Restaura ese local puntual a como estaba; a los demás locales no los toca, sin
+        // importar qué les haya pasado mientras tanto.
+        return { ...d, locales: d.locales.map((l) => (l.id === accion.localId ? accion.localAnterior : l)) };
+      }
+      if (accion.tipo === "addLocal") {
+        // Deshacer "agregar local": sacar ese local puntual (por id, no por posición).
+        return { ...d, locales: d.locales.filter((l) => l.id !== accion.localId) };
+      }
+      if (accion.tipo === "removeLocal") {
+        // Deshacer "borrar local": reinsertarlo tal como estaba, en su posición original.
+        const locales = [...d.locales];
+        locales.splice(Math.min(accion.indice, locales.length), 0, accion.localAnterior);
+        return { ...d, locales };
+      }
+      return d;
+    });
+    setHayDeshacer(undoStack.current.length > 0);
+  };
+
   // Estado de navegación y preferencias visuales: de cada persona/dispositivo, no se sincroniza.
   const [localActivoId, setLocalActivoId] = useState(null);
   const [vendedorActivo, setVendedorActivo] = useState(null);
   const [fechaSeleccionada, setFechaSeleccionada] = useState(null); // { year, month, day } | null
   const [localOpen, setLocalOpen] = useState(false);
   const [configAbierta, setConfigAbierta] = useState(false); // acordeón de "Configuración del local"
+  // Portapapeles de "copiar día": todos los turnos de todos los vendedores de un día puntual,
+  // para pegarlos en otro. Vive solo en esta pestaña, no se persiste.
+  const [diaCopiado, setDiaCopiado] = useState(null); // { localId, fecha, porVendedor } | null
   const [vista, setVista] = useState("mes"); // "mes" | "semana" | "dia"
   const [semanaInicio, setSemanaInicio] = useState(() => lunesDeLaSemana(now));
   const [tema, setTema] = useState(() => {
@@ -408,6 +449,23 @@ export default function App() {
     try { localStorage.setItem(TEMA_KEY, tema); } catch (e) {}
     try { document.body.style.background = tema === "dark" ? "#14181A" : "#EDF1F0"; } catch (e) {}
   }, [tema]);
+
+  // Atajo de teclado Ctrl+Z / Cmd+Z para "Deshacer". Si el foco está en un input/textarea/select
+  // lo dejamos pasar (que gane el deshacer nativo del navegador para ese campo de texto puntual);
+  // en cualquier otro caso (borraste un vendedor, un turno, etc.) dispara nuestro deshacer.
+  const deshacerRef = useRef(() => {});
+  useEffect(() => { deshacerRef.current = deshacer; });
+  useEffect(() => {
+    function onKeyDown(e) {
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "z" || e.shiftKey) return;
+      const tag = document.activeElement && document.activeElement.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      e.preventDefault();
+      deshacerRef.current();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   // Carga inicial: intenta la capacidad "db" (compartida entre dispositivos); si no está
   // disponible, usa localStorage (solo este dispositivo).
@@ -540,8 +598,10 @@ export default function App() {
   const leadBlanks = firstWeekdayMonFirst(year, month);
   const prefix = monthPrefix(year, month);
 
-  const updateLocal = (patch) =>
+  const updateLocal = (patch) => {
+    pushUndo({ tipo: "local", localId: local.id, localAnterior: local });
     setSharedData((d) => ({ ...d, locales: d.locales.map((l) => (l.id === local.id ? { ...l, ...patch } : l)) }));
+  };
 
   const updateVendedor = (vid, patch) =>
     updateLocal({ vendedores: local.vendedores.map((v) => (v.id === vid ? { ...v, ...patch } : v)) });
@@ -574,6 +634,7 @@ export default function App() {
 
   const addLocal = () => {
     const nl = defaultLocal("Nuevo local");
+    pushUndo({ tipo: "addLocal", localId: nl.id });
     setSharedData((d) => ({ ...d, locales: [...d.locales, nl] }));
     setLocalActivoId(nl.id);
     setVendedorActivo(nl.vendedores[0].id);
@@ -586,7 +647,10 @@ export default function App() {
   };
   const removeLocal = (lid) => {
     if (sharedData.locales.length <= 1) return;
+    const indice = sharedData.locales.findIndex((l) => l.id === lid);
+    const localAnterior = sharedData.locales[indice];
     const locales = sharedData.locales.filter((l) => l.id !== lid);
+    pushUndo({ tipo: "removeLocal", localAnterior, indice });
     setSharedData((d) => ({ ...d, locales }));
     if (localActivoId === lid) {
       setLocalActivoId(locales[0].id);
@@ -653,6 +717,45 @@ export default function App() {
     const dias = { ...v.dias };
     delete dias[key];
     updateVendedor(v.id, { dias });
+  };
+
+  // Copiar/pegar un día completo: junta los turnos de TODOS los vendedores del local en esa
+  // fecha (guardado en memoria, no se persiste) y los pega en otra fecha, reemplazando lo que
+  // esos mismos vendedores ya tuvieran cargado ahí. A los vendedores que no trabajaban el día
+  // copiado no se los toca.
+  const copiarDia = (fecha) => {
+    const key = dateKey(fecha.year, fecha.month, fecha.day);
+    const porVendedor = {};
+    local.vendedores.forEach((v) => {
+      const turnos = v.dias[key]?.turnos;
+      if (turnos && turnos.length) porVendedor[v.id] = turnos.map((t) => ({ ...t }));
+    });
+    setDiaCopiado({ localId: local.id, fecha, porVendedor });
+  };
+
+  const pegarDia = (fecha) => {
+    if (!diaCopiado || diaCopiado.localId !== local.id) return 0;
+    const key = dateKey(fecha.year, fecha.month, fecha.day);
+    const idsConCopia = Object.keys(diaCopiado.porVendedor).filter((vid) =>
+      local.vendedores.some((v) => v.id === vid)
+    );
+    if (idsConCopia.length === 0) return 0;
+    pushUndo({ tipo: "local", localId: local.id, localAnterior: local });
+    setSharedData((d) => ({
+      ...d,
+      locales: d.locales.map((l) => {
+        if (l.id !== local.id) return l;
+        return {
+          ...l,
+          vendedores: l.vendedores.map((v) => {
+            const turnos = diaCopiado.porVendedor[v.id];
+            if (!turnos) return v;
+            return { ...v, dias: { ...v.dias, [key]: { turnos: turnos.map((t) => ({ ...t })) } } };
+          }),
+        };
+      }),
+    }));
+    return idsConCopia.length;
   };
 
   const copiarMesAnteriorVendedor = (v) => {
@@ -809,6 +912,14 @@ export default function App() {
             <span style={syncMode === "db" ? S.syncBadgeOn : S.syncBadgeOff}>
               {syncMode === "db" ? "☁ Sincronizado" : "📱 Solo este dispositivo"}
             </span>
+            <button
+              onClick={deshacer}
+              disabled={!hayDeshacer}
+              style={hayDeshacer ? S.undoBtn : S.undoBtnDisabled}
+              title="Deshacer el último cambio (Ctrl+Z)"
+            >
+              ↩ Deshacer
+            </button>
             <button
               onClick={() => setTema((t) => (t === "dark" ? "light" : "dark"))}
               style={S.temaBtn}
@@ -1036,6 +1147,13 @@ export default function App() {
             onCambiarFecha={setFechaSeleccionada}
             onSetTurnos={(turnos) => setTurnosDia(vActivo, fechaSeleccionada, turnos)}
             onQuitarDia={() => quitarDiaVendedor(vActivo, fechaSeleccionada)}
+            copiaDisponible={
+              diaCopiado && diaCopiado.localId === local.id
+                ? { fechaTexto: `${diaCopiado.fecha.day}/${diaCopiado.fecha.month}`, cantidad: Object.keys(diaCopiado.porVendedor).length }
+                : null
+            }
+            onCopiarDia={() => copiarDia(fechaSeleccionada)}
+            onPegarDia={() => pegarDia(fechaSeleccionada)}
           />
 
           <div style={S.card}>
@@ -1370,13 +1488,26 @@ function VendedorEditor({ v, prefix, onChange, onCopiarMesAnterior, onRepetirSem
 
 // Panel de edición del horario del vendedor seleccionado, para la fecha elegida en el calendario.
 // El aviso de huecos y el resumen del día consideran a TODOS los vendedores, no solo al activo.
-function TurnoEditorCard({ vendedor, vendedores, local, fecha, onCambiarFecha, onSetTurnos, onQuitarDia }) {
+function TurnoEditorCard({ vendedor, vendedores, local, fecha, onCambiarFecha, onSetTurnos, onQuitarDia, copiaDisponible, onCopiarDia, onPegarDia }) {
   if (!vendedor) return null;
+
+  const [msgDia, setMsgDia] = useState("");
 
   const cambiarDia = (delta) => {
     const base = fecha || hoyComoFecha();
     const d = sumarDias(new Date(base.year, base.month - 1, base.day), delta);
     onCambiarFecha({ year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate() });
+  };
+
+  const handleCopiarDia = () => {
+    onCopiarDia();
+    setMsgDia("Día copiado");
+    setTimeout(() => setMsgDia(""), 2000);
+  };
+  const handlePegarDia = () => {
+    const n = onPegarDia();
+    setMsgDia(n > 0 ? `Se pegó el horario de ${n} vendedor${n === 1 ? "" : "es"}` : "No hay nada copiado para pegar");
+    setTimeout(() => setMsgDia(""), 2500);
   };
 
   const cerrado = fecha ? estaCerrado(local, fecha.year, fecha.month, fecha.day) : false;
@@ -1401,6 +1532,22 @@ function TurnoEditorCard({ vendedor, vendedores, local, fecha, onCambiarFecha, o
           </div>
         )}
       </div>
+
+      {fecha && (
+        <>
+          <div style={S.rowBetween3}>
+            <button onClick={handleCopiarDia} style={S.copyBtn}>Copiar este día</button>
+            <button
+              onClick={handlePegarDia}
+              disabled={!copiaDisponible}
+              style={copiaDisponible ? S.copyBtn : S.copyBtnDisabled}
+            >
+              Pegar día copiado{copiaDisponible ? ` (${copiaDisponible.fechaTexto} · ${copiaDisponible.cantidad})` : ""}
+            </button>
+          </div>
+          {msgDia && <div style={S.copiadoMsg}>{msgDia}</div>}
+        </>
+      )}
 
       {fecha && (() => {
         const key = dateKey(fecha.year, fecha.month, fecha.day);
@@ -1571,6 +1718,14 @@ const S = {
   },
   syncBadgeOn: { fontSize: 9.5, fontWeight: 700, color: ACCENT },
   syncBadgeOff: { fontSize: 9.5, fontWeight: 700, color: SUB },
+  undoBtn: {
+    fontSize: 11.5, fontWeight: 700, color: INK, background: SURFACE_2, border: "none",
+    borderRadius: 8, padding: "5px 9px", cursor: "pointer", whiteSpace: "nowrap",
+  },
+  undoBtnDisabled: {
+    fontSize: 11.5, fontWeight: 700, color: SUB, background: "transparent", border: "none",
+    borderRadius: 8, padding: "5px 9px", cursor: "default", opacity: 0.4, whiteSpace: "nowrap",
+  },
   temaBtn: {
     width: 22, height: 22, borderRadius: 999, border: "none", background: "transparent",
     fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
@@ -1715,6 +1870,10 @@ const S = {
   copyBtn: {
     fontSize: 11, fontWeight: 700, color: ACCENT, background: ACCENT_SOFT, border: "none",
     borderRadius: 7, padding: "6px 10px", cursor: "pointer", whiteSpace: "nowrap",
+  },
+  copyBtnDisabled: {
+    fontSize: 11, fontWeight: 700, color: SUB, background: SURFACE_2, border: "none",
+    borderRadius: 7, padding: "6px 10px", cursor: "default", whiteSpace: "nowrap", opacity: 0.6,
   },
   copiadoMsg: { fontSize: 11, color: ACCENT, fontWeight: 600, marginTop: 6 },
   note: { fontSize: 11.5, color: DANGER, lineHeight: 1.4 },
