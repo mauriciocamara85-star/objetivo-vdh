@@ -152,6 +152,16 @@ function estaCerrado(local, y, m, d) {
   const wd = new Date(y, m - 1, d).getDay();
   return (local.diasCerrados || []).includes(wd);
 }
+// Horario real de apertura para un día puntual: si ese día de la semana tiene un horario
+// especial cargado (ej. domingos 10 a 21) se usa ese; si no, el horario general del local.
+function horarioDelDia(local, y, m, d) {
+  const wd = new Date(y, m - 1, d).getDay();
+  const especial = (local.horariosEspeciales || {})[wd];
+  return {
+    inicio: especial?.inicio || local.horaInicio || "08:00",
+    fin: especial?.fin || local.horaFin || "22:00",
+  };
+}
 function fmtFechaCorta(iso) {
   const [y, m, d] = iso.split("-");
   return `${d}/${m}/${y}`;
@@ -235,9 +245,9 @@ function fmtTurno(t) {
 function fmtResumenDia(diaObj) {
   return (diaObj?.turnos || []).map(fmtTurno).join(", ");
 }
-function nuevoTurnoDefault(local, existentes) {
-  const desdeMin = minutosDe(local.horaInicio || "08:00");
-  const hastaMin = minutosDe(local.horaFin || "22:00");
+function nuevoTurnoDefault(horaInicio, horaFin, existentes) {
+  const desdeMin = minutosDe(horaInicio || "08:00");
+  const hastaMin = minutosDe(horaFin || "22:00");
   if (!existentes || existentes.length === 0) {
     const finMin = Math.min(desdeMin + 8 * 60, hastaMin);
     return { inicio: minAHHMM(desdeMin), fin: minAHHMM(Math.max(finMin, desdeMin)) };
@@ -665,6 +675,15 @@ function App() {
     updateLocal({ fechasCerradas: (local.fechasCerradas || []).filter((f) => f !== iso) });
   };
 
+  const agregarHorarioEspecial = (wd, inicio, fin) => {
+    updateLocal({ horariosEspeciales: { ...(local.horariosEspeciales || {}), [wd]: { inicio, fin } } });
+  };
+  const quitarHorarioEspecial = (wd) => {
+    const horarios = { ...(local.horariosEspeciales || {}) };
+    delete horarios[wd];
+    updateLocal({ horariosEspeciales: horarios });
+  };
+
   const addVendedor = () => {
     const nv = defaultVendedor("", indiceColorLibre(local.vendedores));
     updateLocal({ vendedores: [...local.vendedores, nv] });
@@ -1071,6 +1090,19 @@ function App() {
                     })}
                   </div>
 
+                  <span style={{ ...S.label, marginTop: 10, display: "block" }}>Horarios especiales (ej. domingos de 10 a 21)</span>
+                  {Object.keys(local.horariosEspeciales || {}).length > 0 && (
+                    <div style={S.feriadoList}>
+                      {Object.entries(local.horariosEspeciales).sort(([a], [b]) => a - b).map(([wd, h]) => (
+                        <span key={wd} style={S.feriadoChip}>
+                          {DIAS_SEMANA_LARGO[wd]} {h.inicio}–{h.fin}
+                          <button onClick={() => quitarHorarioEspecial(wd)} style={S.feriadoRemove}>×</button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <HorarioEspecialPicker local={local} onAgregar={agregarHorarioEspecial} />
+
                   <span style={{ ...S.label, marginTop: 10, display: "block" }}>Feriados / fechas puntuales cerradas</span>
                   <FeriadoPicker onAgregar={agregarFechaCerrada} />
                   {(local.fechasCerradas || []).length > 0 && (
@@ -1281,6 +1313,43 @@ function FeriadoPicker({ onAgregar }) {
   );
 }
 
+// Para cargar, ej., "los domingos abrimos de 10 a 21" en vez del horario general del local.
+// Solo ofrece días que todavía no tengan un horario especial cargado (para cambiar uno ya
+// cargado, primero se lo saca con la × y se vuelve a agregar).
+function HorarioEspecialPicker({ local, onAgregar }) {
+  const diasDisponibles = [0, 1, 2, 3, 4, 5, 6].filter((wd) => !(local.horariosEspeciales || {})[wd]);
+  const [dia, setDia] = useState(diasDisponibles[0]);
+  const [inicio, setInicio] = useState(local.horaInicio || "08:00");
+  const [fin, setFin] = useState(local.horaFin || "22:00");
+  const opciones = generarOpcionesHora("00:00", "23:30");
+
+  if (diasDisponibles.length === 0) return null; // ya hay uno cargado para los 7 días
+
+  const diaActual = diasDisponibles.includes(dia) ? dia : diasDisponibles[0];
+
+  return (
+    <div style={{ marginTop: 6 }}>
+      <select value={diaActual} onChange={(e) => setDia(Number(e.target.value))} style={{ ...S.input, marginBottom: 6 }}>
+        {diasDisponibles.map((wd) => (
+          <option key={wd} value={wd}>{DIAS_SEMANA_LARGO[wd]}</option>
+        ))}
+      </select>
+      <div style={S.twoCol}>
+        <select value={inicio} onChange={(e) => setInicio(e.target.value)} style={S.input}>
+          {opciones.map((h) => <option key={h} value={h}>{h}</option>)}
+        </select>
+        <select value={fin} onChange={(e) => setFin(e.target.value)} style={S.input}>
+          {opciones.map((h) => <option key={h} value={h}>{h}</option>)}
+        </select>
+      </div>
+      <button
+        onClick={() => onAgregar(diaActual, inicio, fin)}
+        style={{ ...S.copyBtn, marginTop: 6 }}
+      >+ Agregar horario especial</button>
+    </div>
+  );
+}
+
 // Calendario mensual: para TODOS los vendedores del local, un resumen compacto de los turnos
 // cargados cada día (nombre + horario, con una tira fina proporcional al horario del local
 // debajo). Marca el día actual, los días cerrados (fijos o feriados) y los huecos de cobertura.
@@ -1299,7 +1368,8 @@ function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, lo
     const resto = entradas.length - visibles.length;
     const seleccionado = !!fechaSeleccionada && fechaSeleccionada.year === year && fechaSeleccionada.month === month && fechaSeleccionada.day === d;
     const hoy = esHoy(year, month, d);
-    const tieneHueco = !cerrado && huecosDelDia(vendedores, key, local.horaInicio, local.horaFin).length > 0;
+    const horarioDia = horarioDelDia(local, year, month, d);
+    const tieneHueco = !cerrado && huecosDelDia(vendedores, key, horarioDia.inicio, horarioDia.fin).length > 0;
 
     let cellStyle = S.dayCell;
     if (seleccionado) cellStyle = S.dayCellSelected;
@@ -1556,8 +1626,9 @@ function TurnoEditorCard({ vendedor, vendedores, local, fecha, onCambiarFecha, o
 
   const cerrado = fecha ? estaCerrado(local, fecha.year, fecha.month, fecha.day) : false;
   const feriado = fecha ? feriadosArgentina(fecha.year)[dateKey(fecha.year, fecha.month, fecha.day)] : null;
+  const horarioDia = fecha ? horarioDelDia(local, fecha.year, fecha.month, fecha.day) : null;
   const huecos = fecha && !cerrado
-    ? huecosDelDia(vendedores, dateKey(fecha.year, fecha.month, fecha.day), local.horaInicio, local.horaFin)
+    ? huecosDelDia(vendedores, dateKey(fecha.year, fecha.month, fecha.day), horarioDia.inicio, horarioDia.fin)
     : [];
 
   return (
@@ -1652,7 +1723,8 @@ function TurnoEditorCard({ vendedor, vendedores, local, fecha, onCambiarFecha, o
 function TurnoEditorDia({ vendedor, local, fecha, onSetTurnos, onQuitarDia }) {
   const key = dateKey(fecha.year, fecha.month, fecha.day);
   const turnos = vendedor.dias[key]?.turnos || [];
-  const opciones = generarOpcionesHora(local.horaInicio, local.horaFin);
+  const horarioDia = horarioDelDia(local, fecha.year, fecha.month, fecha.day);
+  const opciones = generarOpcionesHora(horarioDia.inicio, horarioDia.fin);
   const opcionesInicio = opciones.length > 1 ? opciones.slice(0, -1) : opciones;
 
   const setTurno = (idx, campo, valor) => {
@@ -1663,7 +1735,7 @@ function TurnoEditorDia({ vendedor, local, fecha, onSetTurnos, onQuitarDia }) {
         // alcanza o supera el fin actual, corremos el fin hacia adelante.
         let fin = t.fin;
         if (minutosDe(valor) >= minutosDe(fin)) {
-          fin = minAHHMM(Math.min(minutosDe(valor) + 30, minutosDe(local.horaFin)));
+          fin = minAHHMM(Math.min(minutosDe(valor) + 30, minutosDe(horarioDia.fin)));
         }
         return { ...t, inicio: valor, fin };
       }
@@ -1673,7 +1745,7 @@ function TurnoEditorDia({ vendedor, local, fecha, onSetTurnos, onQuitarDia }) {
   };
   const agregarBloque = () => {
     if (turnos.length >= 2) return;
-    onSetTurnos([...turnos, nuevoTurnoDefault(local, turnos)]);
+    onSetTurnos([...turnos, nuevoTurnoDefault(horarioDia.inicio, horarioDia.fin, turnos)]);
   };
   const quitarBloque = (idx) => {
     const nuevos = turnos.filter((_, i) => i !== idx);
@@ -1926,7 +1998,7 @@ const S = {
   turnoEditorTitle: { display: "flex", alignItems: "center", gap: 7, fontSize: 14, fontWeight: 700, color: INK },
   diaResumenBlock: {
     display: "flex", flexDirection: "column", gap: 5, background: SURFACE_2, borderRadius: 10,
-    padding: "8px 10px", marginBottom: 10,
+    padding: "8px 10px", marginTop: 10, marginBottom: 10,
   },
   diaResumenRow: { display: "flex", alignItems: "center", gap: 6, fontSize: 11.5 },
   diaResumenNombre: { fontWeight: 700, color: INK, flexShrink: 0 },
