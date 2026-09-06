@@ -2324,6 +2324,9 @@ const CSS = `
      botones). El "solo-imprimir" repite adentro el contexto que se pierde al ocultar el header. */
   .solo-imprimir { display: none; }
   @media print {
+    /* Sin esto, Chrome/Edge no imprimen los colores de fondo (para ahorrar tinta) y los
+       turnos quedan como texto pelado en vez de la franja de color de cada vendedor. */
+    * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; color-adjust: exact !important; }
     body, .vdhApp { background: #fff !important; }
     body * { visibility: hidden; }
     .card-calendario, .card-calendario * { visibility: visible; }
