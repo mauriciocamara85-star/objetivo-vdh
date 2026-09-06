@@ -998,6 +998,16 @@ function App() {
     ? diasDeLaSemana(semanaInicio)
     : [new Date(fechaDiaVista.year, fechaDiaVista.month - 1, fechaDiaVista.day)];
 
+  // Encabezado que solo se ve al imprimir (ver S.soloImprimir / @media print más abajo): al
+  // ocultar el resto de la pantalla para imprimir, se pierde el contexto de local/fecha que
+  // daban el header y el navegador de arriba, así que se repite acá adentro de lo que sí queda
+  // visible.
+  const rangoLabelImpresion = vista === "mes"
+    ? `${MESES[mesVista.month - 1]} ${mesVista.year}`
+    : vista === "semana"
+    ? fmtRangoSemana(semanaInicio)
+    : fmtFechaLarga(fechaDiaVista);
+
   return (
     <div className="vdhApp" data-theme={tema} style={S.page}>
       <style>{CSS}</style>
@@ -1231,18 +1241,25 @@ function App() {
         {/* Columna central: calendario, grande */}
         <div className="card-calendario">
           <div style={S.card}>
+            {/* Solo aparece al imprimir: el resto de la pantalla (header, nav, paneles) se
+                oculta con @media print, así que acá adentro repetimos el contexto. */}
+            <div className="solo-imprimir" style={S.encabezadoImpresion}>
+              <div style={S.sectionTitle}>{local.nombre || "Local"}</div>
+              <div style={S.miniStat}>{rangoLabelImpresion}</div>
+            </div>
             <div style={S.rowBetween}>
-              <div>
+              <div className="no-imprimir">
                 <div style={S.sectionTitle}>Calendario de horarios</div>
                 <div style={S.miniStat}>
                   {vista === "mes" ? "Tocá un día para cargar el horario del vendedor seleccionado" : "Tocá un turno para editarlo, o el espacio vacío para elegir el día"}
                   {" · Ctrl+clic (o Cmd+clic) en varios días para copiarlos juntos"}
                 </div>
               </div>
-              <div style={S.vistaSwitchRow}>
+              <div className="no-imprimir" style={S.vistaSwitchRow}>
                 <button onClick={() => cambiarVista("mes")} style={vista === "mes" ? S.vistaBtnActive : S.vistaBtn}>Mes</button>
                 <button onClick={() => cambiarVista("semana")} style={vista === "semana" ? S.vistaBtnActive : S.vistaBtn}>Semana</button>
                 <button onClick={() => cambiarVista("dia")} style={vista === "dia" ? S.vistaBtnActive : S.vistaBtn}>Día</button>
+                <button onClick={() => window.print()} style={S.vistaBtn} title="Imprimir o guardar como PDF">🖨 Imprimir</button>
               </div>
             </div>
             <div style={{ marginTop: 10 }}>
@@ -1551,7 +1568,11 @@ function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFech
   const anchoMin = colAngosta ? dias.length * 108 + 46 : undefined;
 
   return (
-    <div ref={scrollRef} style={{ ...S.semanaScroll, maxHeight: "calc(100vh - 160px)", overflowY: "auto" }}>
+    <div
+      ref={scrollRef}
+      className="semanaScrollImprimible"
+      style={{ ...S.semanaScroll, maxHeight: "calc(100vh - 160px)", overflowY: "auto" }}
+    >
       <div style={{ minWidth: anchoMin }}>
         <div style={{ display: "flex", position: "sticky", top: 0, zIndex: 2, background: CARD, paddingBottom: 2 }}>
           <div style={S.semanaAxisSpacer} />
@@ -2056,6 +2077,7 @@ const S = {
   },
   monthLabel: { fontSize: 14, fontWeight: 700, minWidth: 120, textAlign: "center", color: INK },
   vistaSwitchRow: { display: "flex", gap: 4, flexShrink: 0 },
+  encabezadoImpresion: { marginBottom: 10 },
   vistaBtn: {
     fontSize: 11.5, fontWeight: 700, color: SUB, background: SURFACE_2, border: "none",
     borderRadius: 8, padding: "6px 10px", cursor: "pointer",
@@ -2295,6 +2317,24 @@ const CSS = `
     .card-izquierda { grid-area: izquierda; position: sticky; top: 20px; }
     .card-calendario { grid-area: calendario; }
     .card-derecha { grid-area: derecha; position: sticky; top: 20px; }
+  }
+
+  /* Imprimir / guardar como PDF: se aísla la tarjeta del calendario (nombre del local, fecha y
+     la grilla) y se oculta todo lo demás (header, navegador, paneles de configuración/reparto,
+     botones). El "solo-imprimir" repite adentro el contexto que se pierde al ocultar el header. */
+  .solo-imprimir { display: none; }
+  @media print {
+    body, .vdhApp { background: #fff !important; }
+    body * { visibility: hidden; }
+    .card-calendario, .card-calendario * { visibility: visible; }
+    .card-calendario {
+      position: absolute; left: 0; top: 0; width: 100% !important;
+      box-shadow: none !important;
+    }
+    .no-imprimir { display: none !important; }
+    .solo-imprimir { display: block !important; margin-bottom: 10px; }
+    .semanaScrollImprimible { max-height: none !important; overflow: visible !important; }
+    .semanaScrollImprimible > div { min-width: 0 !important; }
   }
 `;
 
