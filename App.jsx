@@ -7,13 +7,15 @@ import {
   ChevronDown,
   Check,
   Store,
+  Share2,
+  Printer,
 } from "lucide-react";
 
 const STORAGE_KEY = "vdh-objetivo-calendario"; // fallback localStorage (sin capacidad "db")
 const UI_PREFS_KEY = "vdh-objetivo-ui-prefs"; // preferencias locales de navegación (no se comparten)
 const TEMA_KEY = "vdh-objetivo-tema";
 const DB_DOC_PATH = "app/data"; // documento compartido cuando la capacidad "db" está disponible
-const DATA_VERSION = 3;
+const DATA_VERSION = 5;
 const DIAS_SEMANA = ["L", "M", "M", "J", "V", "S", "D"];
 const DIAS_SEMANA_LARGO = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
 // Convierte el índice de DIAS_SEMANA (0=Lun...6=Dom) al valor que devuelve Date.getDay() (0=Dom...6=Sab).
@@ -134,6 +136,39 @@ function horarioDelDia(local, y, m, d) {
     inicio: especial?.inicio || local.horaInicio || "08:00",
     fin: especial?.fin || local.horaFin || "22:00",
   };
+}
+// Vacaciones de un vendedor: rangos de fechas puntuales (ambas fechas inclusive), guardados en
+// vendedor.vacaciones. Un vendedor puede tener varios rangos sueltos a la vez.
+function estaDeVacaciones(vendedor, y, m, d) {
+  const key = dateKey(y, m, d);
+  return (vendedor.vacaciones || []).some((r) => key >= r.inicio && key <= r.fin);
+}
+// Vendedores de un local que están de vacaciones un día puntual (para marcarlo en el calendario).
+function vendedoresDeVacaciones(vendedores, y, m, d) {
+  return vendedores.filter((v) => estaDeVacaciones(v, y, m, d));
+}
+// Última fecha (inclusive) de un período de vacaciones: "N semanas desde el inicio" = inicio + N*7 - 1 días.
+function finDeVacaciones(inicioISO, semanas) {
+  const { year, month, day } = fechaDeKey(inicioISO);
+  const fin = sumarDias(new Date(year, month - 1, day), Number(semanas) * 7 - 1);
+  return dateKey(fin.getFullYear(), fin.getMonth() + 1, fin.getDate());
+}
+// Dos rangos de fechas (ISO, ambos inclusive) se pisan si el inicio de uno cae antes del fin del
+// otro y viceversa.
+function rangosSeSuperponen(aIni, aFin, bIni, bFin) {
+  return aIni <= bFin && bIni <= aFin;
+}
+// Franco fijo de un vendedor: días de la semana (0=Dom...6=Sab, igual convención que
+// local.diasCerrados) en los que ese vendedor libra todas las semanas. Rige desde HOY en
+// adelante — no afecta días ya pasados, para no tapar horario ya trabajado.
+function esFrancoVendedor(vendedor, y, m, d) {
+  const wd = new Date(y, m - 1, d).getDay();
+  if (!(vendedor.francos || []).includes(wd)) return false;
+  const hoy = hoyComoFecha();
+  return dateKey(y, m, d) >= dateKey(hoy.year, hoy.month, hoy.day);
+}
+function vendedoresDeFranco(vendedores, y, m, d) {
+  return vendedores.filter((v) => esFrancoVendedor(v, y, m, d));
 }
 function fmtFechaCorta(iso) {
   const [y, m, d] = iso.split("-");
@@ -290,6 +325,8 @@ function defaultVendedor(nombre, colorIndex) {
     nombre,
     color: PALETA_VENDEDORES[colorIndex % PALETA_VENDEDORES.length],
     dias: {}, // { "2026-09-05": { turnos: [{inicio:"09:00", fin:"17:00"}, ...] } }
+    vacaciones: [], // [{ id, inicio: "2026-11-10", fin: "2026-11-23" }, ...] (ambas fechas inclusive)
+    francos: [], // días de la semana (0=Dom...6=Sab) en los que libra fijo todas las semanas
   };
 }
 
@@ -369,7 +406,7 @@ function migrarDatos(parsed) {
             const iAnterior = PALETA_VENDEDORES_ANTERIOR.indexOf(color);
             if (iAnterior !== -1) color = PALETA_VENDEDORES[iAnterior];
           }
-          return { ...v, color, dias: formatoTurnosYaMigrado ? v.dias || {} : {} };
+          return { ...v, color, dias: formatoTurnosYaMigrado ? v.dias || {} : {}, vacaciones: v.vacaciones || [], francos: v.francos || [] };
         })
       ),
     };
@@ -412,8 +449,17 @@ export default function App() {
   // vía la capacidad "db" cuando está disponible; si no, cae a localStorage (un solo dispositivo).
   const [sharedData, setSharedData] = useState(null);
   const [loaded, setLoaded] = useState(false);
-  const [saved, setSaved] = useState(false);
+  // "idle" (nada que mostrar) | "guardando" | "guardado" (se apaga solo a los 900ms) | "error"
+  // (persiste hasta que se reintenta con éxito — antes, si el guardado fallaba, no había
+  // ninguna señal más que un console.error, y el cambio se perdía en silencio).
+  const [estadoGuardado, setEstadoGuardado] = useState("idle");
   const [syncMode, setSyncMode] = useState("local"); // "db" | "local"
+  const retryGuardadoRef = useRef(null);
+  const [reintentoGuardadoTick, setReintentoGuardadoTick] = useState(0);
+  const forzarReintentoGuardado = () => {
+    if (retryGuardadoRef.current) { clearTimeout(retryGuardadoRef.current); retryGuardadoRef.current = null; }
+    setReintentoGuardadoTick((t) => t + 1);
+  };
 
   // Deshacer: antes de cada cambio que hace la persona en este dispositivo (no lo que llega
   // sincronizado de otro dispositivo) se guarda cómo estaba ANTES la parte puntual que se tocó
@@ -453,18 +499,61 @@ export default function App() {
     setHayDeshacer(undoStack.current.length > 0);
   };
 
+  // Toast único para avisar "hice esto" (copiar/pegar días, borrar un vendedor o un local,
+  // reiniciar el mes): reemplaza los mensajes sueltos que cada acción mostraba a su manera y en
+  // su propio lugar de la pantalla. Si la acción es deshacible, el toast ofrece el botón acá
+  // mismo en vez de mandar a la persona a buscar el "↩ Deshacer" del header.
+  const [toast, setToast] = useState(null); // { mensaje, deshacible } | null
+  const toastTimerRef = useRef(null);
+  const mostrarToast = (mensaje, { deshacible = false } = {}) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast({ mensaje, deshacible });
+    toastTimerRef.current = setTimeout(() => setToast(null), deshacible ? 6000 : 3200);
+  };
+  const deshacerDesdeToast = () => {
+    deshacer();
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast(null);
+  };
+
   // Estado de navegación y preferencias visuales: de cada persona/dispositivo, no se sincroniza.
   const [localActivoId, setLocalActivoId] = useState(null);
   const [vendedorActivo, setVendedorActivo] = useState(null);
   const [fechaSeleccionada, setFechaSeleccionada] = useState(null); // { year, month, day } | null
   const [localOpen, setLocalOpen] = useState(false);
   const [configAbierta, setConfigAbierta] = useState(false); // acordeón de "Configuración del local"
+  // Paneles laterales plegables (como el menú ☰ de Google Calendar): con un solo botón se van los
+  // dos y el calendario pasa a ocupar todo el ancho de la pantalla, que es cuando mejor se lee y
+  // mejor sale la foto para mandar al grupo.
+  const [panelesAbiertos, setPanelesAbiertos] = useState(true);
   // Portapapeles de "copiar día": todos los turnos de todos los vendedores de un día puntual,
   // para pegarlos en otro. Vive solo en esta pestaña, no se persiste.
   const [diaCopiado, setDiaCopiado] = useState(null); // { localId, dias: [{offsetDias, porVendedor}] } | null
   // Días marcados con Ctrl/Cmd+clic en el calendario para copiarlos todos juntos ("YYYY-MM-DD").
   // Se vacía solo al copiar, o al cambiar de local (los días de otro local no tienen sentido acá).
   const [diasParaCopiar, setDiasParaCopiar] = useState(() => new Set());
+  // Para "Compartir imagen": referencia a la tarjeta del calendario (se le saca una foto con
+  // html2canvas) y si hay una generación en curso, para deshabilitar el botón mientras tanto.
+  const calendarioRef = useRef(null);
+  const [generandoImagen, setGenerandoImagen] = useState(false);
+  // A quién resaltar en la imagen compartida: "" = todos parejo (la típica, para mandar al grupo);
+  // un id de vendedor = ese queda a todo color y el resto atenuado (para mandarle a uno solo).
+  const [resaltarEnCompartir, setResaltarEnCompartir] = useState("");
+  // Menú "Compartir" (imagen + imprimir + a quién resaltar): antes esto vivía repartido en la
+  // barra de vistas (Mes/Semana/Día mezclado con exportar), ahora es su propio botón con un
+  // panel desplegable, como el share sheet de cualquier app — se cierra solo al clickear afuera.
+  const [compartirAbierto, setCompartirAbierto] = useState(false);
+  const compartirMenuRef = useRef(null);
+  useEffect(() => {
+    if (!compartirAbierto) return;
+    const onClickFuera = (e) => {
+      if (compartirMenuRef.current && !compartirMenuRef.current.contains(e.target)) {
+        setCompartirAbierto(false);
+      }
+    };
+    document.addEventListener("mousedown", onClickFuera);
+    return () => document.removeEventListener("mousedown", onClickFuera);
+  }, [compartirAbierto]);
   const toggleDiaParaCopiar = (fecha) => {
     const key = dateKey(fecha.year, fecha.month, fecha.day);
     setDiasParaCopiar((prev) => {
@@ -597,21 +686,40 @@ export default function App() {
     if (serializado === lastWrittenRef.current) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
-      lastWrittenRef.current = serializado;
+      setEstadoGuardado("guardando");
       try {
         if (syncMode === "db" && dbDocRef.current) {
           await dbDocRef.current.set(sharedData);
         } else {
           localStorage.setItem(STORAGE_KEY, serializado);
         }
-        setSaved(true);
-        setTimeout(() => setSaved(false), 900);
+        // Recién ACÁ se marca como escrito lo que se mandó — si el guardado de abajo tira
+        // error, esta línea nunca se ejecuta, "serializado" sigue sin coincidir con lo último
+        // escrito, y el reintento automático (o el próximo cambio) vuelve a mandar este mismo
+        // dato. Antes esto se marcaba ANTES del try: si el guardado fallaba, el cambio quedaba
+        // dado por guardado sin estarlo, y se perdía sin que nadie se enterara.
+        lastWrittenRef.current = serializado;
+        setEstadoGuardado("guardado");
+        setTimeout(() => setEstadoGuardado((e) => (e === "guardado" ? "idle" : e)), 900);
       } catch (e) {
         console.error(e);
+        setEstadoGuardado("error");
+        // Reintento automático con backoff simple: sin esto, si la persona no vuelve a tocar
+        // nada, un guardado que falló se queda sin reintentar para siempre (este efecto solo
+        // se dispara cuando cambia sharedData).
+        if (retryGuardadoRef.current) clearTimeout(retryGuardadoRef.current);
+        retryGuardadoRef.current = setTimeout(() => setReintentoGuardadoTick((t) => t + 1), 5000);
       }
     }, 450);
     return () => clearTimeout(saveTimer.current);
-  }, [sharedData, loaded, syncMode]);
+  }, [sharedData, loaded, syncMode, reintentoGuardadoTick]);
+
+  // Si se corta y vuelve la conexión, reintenta enseguida en vez de esperar el backoff de 5s.
+  useEffect(() => {
+    const onOnline = () => forzarReintentoGuardado();
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+  }, []);
 
   // Primera vez que hay datos: elegir local/vendedor activo (de las preferencias
   // guardadas en este dispositivo, si siguen existiendo).
@@ -666,6 +774,40 @@ export default function App() {
     const nuevos = actuales.includes(wd) ? actuales.filter((x) => x !== wd) : [...actuales, wd];
     updateLocal({ diasCerrados: nuevos });
   };
+
+  // Franco fijo semanal de un vendedor. Al activarlo se borran los turnos que ya tuviera
+  // cargados en ese día de la semana de HOY en adelante (para que el calendario futuro quede
+  // consistente), pero no se toca nada de fechas pasadas — el historial de horas ya trabajadas
+  // (usado para el reparto de meses cerrados) queda intacto.
+  const toggleFrancoVendedor = (vendedorId, wd) => {
+    const v = local.vendedores.find((x) => x.id === vendedorId);
+    if (!v) return;
+    const actuales = v.francos || [];
+    const activando = !actuales.includes(wd);
+    const francos = activando ? [...actuales, wd] : actuales.filter((x) => x !== wd);
+    let dias = v.dias;
+    let turnosBorrados = 0;
+    if (activando) {
+      const hoy = hoyComoFecha();
+      const hoyKey = dateKey(hoy.year, hoy.month, hoy.day);
+      dias = { ...v.dias };
+      Object.keys(dias).forEach((k) => {
+        if (k < hoyKey) return;
+        const { year, month, day } = fechaDeKey(k);
+        if (new Date(year, month - 1, day).getDay() === wd) { delete dias[k]; turnosBorrados++; }
+      });
+    }
+    updateVendedor(vendedorId, { francos, dias });
+    if (activando) {
+      mostrarToast(
+        `Franco fijo: ${v.nombre || "vendedor"} los ${DIAS_SEMANA_LARGO[wd]}` +
+          (turnosBorrados > 0 ? ` · se borraron ${turnosBorrados} turno(s) futuro(s) ese día` : ""),
+        { deshacible: true }
+      );
+    } else {
+      mostrarToast(`Se sacó el franco fijo de los ${DIAS_SEMANA_LARGO[wd]}`, { deshacible: true });
+    }
+  };
   const agregarFechaCerrada = (iso) => {
     if (!iso) return;
     const actuales = local.fechasCerradas || [];
@@ -685,15 +827,50 @@ export default function App() {
     updateLocal({ horariosEspeciales: horarios });
   };
 
+  const agregarVacacion = (vendedorId, inicioISO, semanas) => {
+    if (!inicioISO) return;
+    const v = local.vendedores.find((x) => x.id === vendedorId);
+    if (!v) return;
+    const finISO = finDeVacaciones(inicioISO, semanas);
+    const actuales = v.vacaciones || [];
+    const solapa = actuales.some((r) => rangosSeSuperponen(inicioISO, finISO, r.inicio, r.fin));
+    if (solapa) {
+      mostrarToast(`${v.nombre || "Ese vendedor"} ya tiene vacaciones cargadas que se superponen con esas fechas.`);
+      return;
+    }
+    // De vacaciones no se puede tener horario cargado: se borra cualquier turno ya cargado de
+    // ese vendedor dentro del rango, sea del mes que sea (no solo el que se está viendo).
+    const dias = { ...v.dias };
+    let turnosBorrados = 0;
+    Object.keys(dias).forEach((k) => {
+      if (k >= inicioISO && k <= finISO) { delete dias[k]; turnosBorrados++; }
+    });
+    const vacaciones = [...actuales, { id: uid(), inicio: inicioISO, fin: finISO }].sort((a, b) => a.inicio.localeCompare(b.inicio));
+    updateVendedor(vendedorId, { dias, vacaciones });
+    mostrarToast(
+      `Vacaciones cargadas: ${v.nombre || "vendedor"}, ${fmtFechaCorta(inicioISO)} al ${fmtFechaCorta(finISO)}` +
+        (turnosBorrados > 0 ? ` · se borraron ${turnosBorrados} día(s) con horario ya cargado` : ""),
+      { deshacible: true }
+    );
+  };
+  const quitarVacacion = (vendedorId, vacacionId) => {
+    const v = local.vendedores.find((x) => x.id === vendedorId);
+    if (!v) return;
+    updateVendedor(vendedorId, { vacaciones: (v.vacaciones || []).filter((r) => r.id !== vacacionId) });
+    mostrarToast("Vacaciones eliminadas", { deshacible: true });
+  };
+
   const addVendedor = () => {
     const nv = defaultVendedor("", indiceColorLibre(local.vendedores));
     updateLocal({ vendedores: [...local.vendedores, nv] });
     setVendedorActivo(nv.id);
   };
   const removeVendedor = (vid) => {
+    const eliminado = local.vendedores.find((v) => v.id === vid);
     const restantes = local.vendedores.filter((v) => v.id !== vid);
     updateLocal({ vendedores: restantes });
     if (vendedorActivo === vid) setVendedorActivo(restantes[0]?.id || null);
+    mostrarToast(`Se eliminó a ${eliminado?.nombre || "el vendedor"}`, { deshacible: true });
   };
 
   const addLocal = () => {
@@ -722,6 +899,7 @@ export default function App() {
       setVendedorActivo(locales[0].vendedores[0]?.id || null);
     }
     setFechaSeleccionada(null);
+    mostrarToast(`Se eliminó el local "${localAnterior.nombre || "Local"}"`, { deshacible: true });
   };
 
   const cambiarMes = (delta) => {
@@ -808,10 +986,14 @@ export default function App() {
       return { offsetDias, porVendedor };
     });
     setDiaCopiado({ localId: local.id, dias });
+    mostrarToast(dias.length === 1 ? "Día copiado" : `${dias.length} días copiados`);
   };
 
   const pegarDias = (fecha) => {
-    if (!diaCopiado || diaCopiado.localId !== local.id || !fecha) return 0;
+    if (!diaCopiado || diaCopiado.localId !== local.id || !fecha) {
+      mostrarToast("No hay nada copiado para pegar");
+      return 0;
+    }
     const anchor = new Date(fecha.year, fecha.month - 1, fecha.day);
     const porDia = diaCopiado.dias
       .map(({ offsetDias, porVendedor }) => {
@@ -822,7 +1004,10 @@ export default function App() {
         return { key, entradas };
       })
       .filter((d) => d.entradas.length > 0);
-    if (porDia.length === 0) return 0;
+    if (porDia.length === 0) {
+      mostrarToast("No hay nada para pegar en esa fecha");
+      return 0;
+    }
 
     pushUndo({ tipo: "local", localId: local.id, localAnterior: local });
     setSharedData((d) => ({
@@ -844,6 +1029,7 @@ export default function App() {
         };
       }),
     }));
+    mostrarToast(porDia.length === 1 ? "Se pegó 1 día" : `Se pegaron ${porDia.length} días`, { deshacible: true });
     return porDia.length; // cantidad de días efectivamente pegados
   };
 
@@ -858,11 +1044,17 @@ export default function App() {
       const diaNum = Number(k.slice(-2));
       if (diaNum < 1 || diaNum > nDias) return;
       const nuevaKey = dateKey(year, month, diaNum);
-      if (dias[nuevaKey] !== undefined) return; // no pisa días que ya cargaste este mes
+      // No pisa días que ya cargaste este mes, ni días de vacaciones o franco fijo (bloqueados).
+      if (dias[nuevaKey] !== undefined) return;
+      if (estaDeVacaciones(v, year, month, diaNum) || esFrancoVendedor(v, year, month, diaNum)) return;
       dias[nuevaKey] = { turnos: (diaObj.turnos || []).map((t) => ({ ...t })) };
       copiados++;
     });
     if (copiados > 0) updateVendedor(v.id, { dias });
+    mostrarToast(
+      copiados > 0 ? `Se copiaron ${copiados} días del mes anterior` : "No hay días el mes pasado para copiar",
+      { deshacible: copiados > 0 }
+    );
     return copiados;
   };
 
@@ -880,6 +1072,7 @@ export default function App() {
     for (let d = 8; d <= nDias; d++) {
       const key = dateKey(year, month, d);
       if (dias[key] !== undefined) continue;
+      if (estaDeVacaciones(v, year, month, d) || esFrancoVendedor(v, year, month, d)) continue;
       const wd = new Date(year, month - 1, d).getDay();
       const patron = patronPorDiaSemana[wd];
       if (patron) {
@@ -888,6 +1081,10 @@ export default function App() {
       }
     }
     if (copiados > 0) updateVendedor(v.id, { dias });
+    mostrarToast(
+      copiados > 0 ? `Se repitieron ${copiados} días según la primera semana` : "Cargá al menos un día en la primera semana (1 al 7) para repetir",
+      { deshacible: copiados > 0 }
+    );
     return copiados;
   };
 
@@ -903,6 +1100,7 @@ export default function App() {
       const keyActual = dateKey(actual.getFullYear(), actual.getMonth() + 1, actual.getDate());
       const keyAnterior = dateKey(anterior.getFullYear(), anterior.getMonth() + 1, anterior.getDate());
       if (dias[keyActual] !== undefined) continue;
+      if (estaDeVacaciones(v, actual.getFullYear(), actual.getMonth() + 1, actual.getDate()) || esFrancoVendedor(v, actual.getFullYear(), actual.getMonth() + 1, actual.getDate())) continue;
       const origen = v.dias[keyAnterior];
       if (origen && origen.turnos && origen.turnos.length) {
         dias[keyActual] = { turnos: origen.turnos.map((t) => ({ ...t })) };
@@ -910,10 +1108,17 @@ export default function App() {
       }
     }
     if (copiados > 0) updateVendedor(v.id, { dias });
+    mostrarToast(
+      copiados > 0 ? `Se copiaron ${copiados} días de la semana anterior` : "No hay datos la semana anterior para copiar",
+      { deshacible: copiados > 0 }
+    );
     return copiados;
   };
 
   const resetMes = () => {
+    if (!window.confirm(`¿Reiniciar ${MESES[month - 1]} en "${local.nombre || "este local"}"? Se van a borrar los horarios cargados de todos los vendedores de ESTE local ese mes (los demás locales no se tocan; después lo podés deshacer con Ctrl+Z si te arrepentís).`)) {
+      return;
+    }
     updateLocal({
       vendedores: local.vendedores.map((v) => {
         const dias = { ...v.dias };
@@ -923,6 +1128,7 @@ export default function App() {
         return { ...v, dias };
       }),
     });
+    mostrarToast(`Se reinició ${MESES[month - 1]}`, { deshacible: true });
     setFechaSeleccionada(null);
   };
 
@@ -944,6 +1150,19 @@ export default function App() {
     const monto = (pct / 100) * (Number(local.objetivoTotal) || 0);
     return { ...v, horas, pct, monto };
   });
+
+  // Vacaciones de todos los vendedores del local, en una sola lista ordenada por fecha (para el
+  // listado de chips en "Configuración del local" — a diferencia de feriados/horarios especiales,
+  // acá hay que mostrar de qué vendedor es cada rango).
+  const todasVacaciones = local.vendedores
+    .flatMap((v) => (v.vacaciones || []).map((r) => ({ ...r, vendedorId: v.id, vendedorNombre: v.nombre, vendedorColor: v.color })))
+    .sort((a, b) => a.inicio.localeCompare(b.inicio));
+
+  // Francos fijos de todos los vendedores del local, aplanados para el listado de chips (un
+  // chip por combinación vendedor+día, para poder sacar uno solo sin afectar el resto).
+  const todosFrancos = local.vendedores
+    .flatMap((v) => (v.francos || []).map((wd) => ({ id: `${v.id}-${wd}`, vendedorId: v.id, vendedorNombre: v.nombre, vendedorColor: v.color, wd })))
+    .sort((a, b) => a.wd - b.wd || (a.vendedorNombre || "").localeCompare(b.vendedorNombre || ""));
   const pctTotal = filas.reduce((s, f) => s + f.pct, 0);
   const montoTotal = filas.reduce((s, f) => s + f.monto, 0);
 
@@ -964,13 +1183,85 @@ export default function App() {
     ? fmtRangoSemana(semanaInicio)
     : fmtFechaLarga(fechaDiaVista);
 
+  // "Compartir imagen": convierte la tarjeta del calendario en un PNG (con html2canvas) y abre
+  // el selector nativo para compartir (WhatsApp, etc.) si el navegador lo permite; si no —la
+  // mayoría de las compus—, descarga el PNG para adjuntarlo a mano. Reutiliza las mismas clases
+  // "no-imprimir"/"solo-imprimir" del botón Imprimir para mostrar una versión limpia (sin
+  // botones ni recortes de alto) mientras saca la foto, y las saca apenas termina.
+  const compartirImagen = async () => {
+    const el = calendarioRef.current;
+    if (!el || !window.html2canvas || generandoImagen) {
+      if (!window.html2canvas) alert("No se pudo cargar la herramienta para generar la imagen. Probá de nuevo en unos segundos.");
+      return;
+    }
+    setGenerandoImagen(true);
+    el.classList.add("capturando-imagen");
+    // Si se eligió resaltar a alguien, sus turnos quedan a todo color y los del resto del equipo
+    // atenuados, para mandarle la imagen a esa persona. Por defecto ("Todos") no se atenúa nada,
+    // que es lo que sirve para mandar el horario completo al grupo.
+    const vendedorResaltado = local.vendedores.find((v) => v.id === resaltarEnCompartir) || null;
+    const estiloResaltado = document.createElement("style");
+    if (vendedorResaltado) {
+      estiloResaltado.textContent = `.capturando-imagen [data-vendedor-id]:not([data-vendedor-id="${vendedorResaltado.id}"]) { opacity: 0.3 !important; filter: grayscale(70%) !important; }`;
+      document.head.appendChild(estiloResaltado);
+    }
+    const limpiar = () => {
+      el.classList.remove("capturando-imagen");
+      if (estiloResaltado.parentNode) estiloResaltado.parentNode.removeChild(estiloResaltado);
+    };
+    try {
+      await new Promise((r) => setTimeout(r, 50)); // deja que el navegador aplique los estilos antes de la foto
+      const canvas = await window.html2canvas(el, { backgroundColor: null, scale: 2, useCORS: true });
+      limpiar();
+      const nombre = `Horario ${local.nombre || "local"}${vendedorResaltado ? " - " + (vendedorResaltado.nombre || "vendedor") : ""} - ${rangoLabelImpresion}`
+        .replace(/[\\/:*?"<>|]+/g, "").trim() + ".png";
+      canvas.toBlob(async (blob) => {
+        if (!blob) { setGenerandoImagen(false); return; }
+        const file = new File([blob], nombre, { type: "image/png" });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          try {
+            await navigator.share({ files: [file], title: "Horario" });
+            setGenerandoImagen(false);
+            return;
+          } catch (e) {
+            setGenerandoImagen(false);
+            if (e.name === "AbortError") return; // canceló el cartel de compartir, no bajamos nada
+          }
+        }
+        // Sin Web Share con archivos (la mayoría de las compus): se descarga el PNG para
+        // adjuntarlo a mano en WhatsApp Web/Escritorio.
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = nombre;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 3000);
+        setGenerandoImagen(false);
+      }, "image/png");
+    } catch (e) {
+      limpiar();
+      setGenerandoImagen(false);
+      console.error(e);
+      alert("No se pudo generar la imagen. Probá de nuevo.");
+    }
+  };
+
   return (
-    <div className="vdhApp" data-theme={tema} style={S.page}>
+    <div className="vdhApp" data-theme={tema} style={panelesAbiertos ? S.page : { ...S.page, maxWidth: "none" }}>
       <style>{CSS}</style>
 
       {/* Header: compacto, todo en una fila, para dejarle más lugar al calendario */}
       <div style={S.headerBand}>
         <div style={S.logoRow}>
+          <button
+            onClick={() => setPanelesAbiertos((a) => !a)}
+            style={S.panelToggleBtn}
+            title={panelesAbiertos ? "Ocultar los paneles laterales y agrandar el calendario" : "Volver a mostrar los paneles laterales"}
+          >
+            ☰
+          </button>
           <div style={S.logoMark}>VDH</div>
           <div>
             <div style={S.brandTitle}>Objetivo VDH</div>
@@ -1027,10 +1318,24 @@ export default function App() {
               {tema === "dark" ? "☀️" : "🌙"}
             </button>
           </div>
-          <div style={{ ...S.savedPill, opacity: saved ? 1 : 0.001 }}>
-            <Check size={11} strokeWidth={3} />
-            <span>Guardado</span>
-          </div>
+          {estadoGuardado === "error" ? (
+            <button
+              onClick={forzarReintentoGuardado}
+              style={S.errorPill}
+              title="Tu último cambio no se pudo guardar. Tocá para reintentar ahora."
+            >
+              ⚠ {typeof navigator !== "undefined" && navigator.onLine === false ? "Sin conexión" : "No se guardó"} · Reintentar
+            </button>
+          ) : (
+            <div style={{ ...S.savedPill, opacity: estadoGuardado === "idle" ? 0.001 : 1 }}>
+              {estadoGuardado === "guardando" ? (
+                <span className="dotPulso" />
+              ) : (
+                <Check size={11} strokeWidth={3} />
+              )}
+              <span>{estadoGuardado === "guardando" ? "Guardando…" : "Guardado"}</span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -1040,8 +1345,10 @@ export default function App() {
         onPrev={navPrev} onNext={navNext} onHoy={irAHoy}
       />
 
-      <div className="appGrid">
-        {/* Columna izquierda: configuración y edición */}
+      <div className={`appGrid${panelesAbiertos ? "" : " sin-paneles"}`}>
+        {/* Columna izquierda: configuración y edición. Se saca del DOM (no se esconde) al plegar,
+            si no la grilla le sigue reservando su columna y el calendario no se estira. */}
+        {panelesAbiertos && (
         <div className="card-izquierda">
           <div style={S.card}>
             <div style={S.rowBetween}>
@@ -1082,7 +1389,7 @@ export default function App() {
             </button>
 
             {configAbierta && (
-              <>
+              <div className="acordeonContenido">
                 <div style={{ ...S.twoCol, marginTop: 10 }}>
                   <label style={S.field}>
                     <span style={S.label}>Local abre desde</span>
@@ -1152,7 +1459,39 @@ export default function App() {
                     </div>
                   )}
                 </div>
-              </>
+
+                <div style={S.cerradosBlock}>
+                  <span style={S.label}>Vacaciones de vendedores</span>
+                  <VacacionesPicker local={local} onAgregar={agregarVacacion} />
+                  {todasVacaciones.length > 0 && (
+                    <div style={S.feriadoList}>
+                      {todasVacaciones.map((r) => (
+                        <span key={r.id} style={S.feriadoChip}>
+                          <span style={{ ...S.chipDot, background: r.vendedorColor }} />
+                          {r.vendedorNombre || "Sin nombre"}: {fmtFechaCorta(r.inicio)}–{fmtFechaCorta(r.fin)}
+                          <button onClick={() => quitarVacacion(r.vendedorId, r.id)} style={S.feriadoRemove}>×</button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div style={S.cerradosBlock}>
+                  <span style={S.label}>Franco fijo de vendedores</span>
+                  <FrancoPicker local={local} onToggle={toggleFrancoVendedor} />
+                  {todosFrancos.length > 0 && (
+                    <div style={S.feriadoList}>
+                      {todosFrancos.map((f) => (
+                        <span key={f.id} style={S.feriadoChip}>
+                          <span style={{ ...S.chipDot, background: f.vendedorColor }} />
+                          {f.vendedorNombre || "Sin nombre"}: {DIAS_SEMANA_LARGO[f.wd]}
+                          <button onClick={() => toggleFrancoVendedor(f.vendedorId, f.wd)} style={S.feriadoRemove}>×</button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
             )}
           </div>
 
@@ -1193,12 +1532,15 @@ export default function App() {
             )}
           </div>
         </div>
+        )}
 
         {/* Columna central: calendario, grande */}
-        <div className="card-calendario">
+        <div className="card-calendario" ref={calendarioRef}>
           <div style={S.card}>
-            {/* Solo aparece al imprimir: el resto de la pantalla (header, nav, paneles) se
-                oculta con @media print, así que acá adentro repetimos el contexto. */}
+            {/* Este bloque y las clases "no-imprimir"/"solo-imprimir" de acá abajo se usan tanto
+                para Imprimir (@media print) como para "Compartir imagen" (clase .capturando-imagen
+                agregada a mano un instante antes de sacar la foto): en los dos casos se oculta el
+                resto de la pantalla y se repite acá el contexto (local y fecha). */}
             <div className="solo-imprimir" style={S.encabezadoImpresion}>
               <div style={S.sectionTitle}>{local.nombre || "Local"}</div>
               <div style={S.miniStat}>{rangoLabelImpresion}</div>
@@ -1215,7 +1557,48 @@ export default function App() {
                 <button onClick={() => cambiarVista("mes")} style={vista === "mes" ? S.vistaBtnActive : S.vistaBtn}>Mes</button>
                 <button onClick={() => cambiarVista("semana")} style={vista === "semana" ? S.vistaBtnActive : S.vistaBtn}>Semana</button>
                 <button onClick={() => cambiarVista("dia")} style={vista === "dia" ? S.vistaBtnActive : S.vistaBtn}>Día</button>
-                <button onClick={() => window.print()} style={S.vistaBtn} title="Imprimir o guardar como PDF">🖨 Imprimir</button>
+                <div ref={compartirMenuRef} style={S.compartirMenuWrap}>
+                  <button
+                    onClick={() => setCompartirAbierto((o) => !o)}
+                    style={compartirAbierto ? S.vistaBtnActive : S.vistaBtn}
+                    title="Compartir imagen o imprimir este calendario"
+                    aria-expanded={compartirAbierto}
+                    aria-haspopup="true"
+                  >
+                    <Share2 size={13} />
+                  </button>
+                  {compartirAbierto && (
+                    <div style={S.compartirMenuPanel}>
+                      <div style={S.compartirMenuTitulo}>Compartir</div>
+                      <label style={S.compartirMenuLabel}>
+                        Resaltar a
+                        <select
+                          value={resaltarEnCompartir}
+                          onChange={(e) => setResaltarEnCompartir(e.target.value)}
+                          style={S.compartirMenuSelect}
+                        >
+                          <option value="">Todos parejo</option>
+                          {local.vendedores.map((v) => (
+                            <option key={v.id} value={v.id}>{v.nombre || "Sin nombre"}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <button
+                        onClick={() => { compartirImagen(); setCompartirAbierto(false); }}
+                        disabled={generandoImagen}
+                        style={S.compartirMenuBtn}
+                      >
+                        <Share2 size={13} /> {generandoImagen ? "Generando…" : "Compartir imagen"}
+                      </button>
+                      <button
+                        onClick={() => { setCompartirAbierto(false); setTimeout(() => window.print(), 50); }}
+                        style={S.compartirMenuBtn}
+                      >
+                        <Printer size={13} /> Imprimir / Guardar PDF
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
             <div style={{ marginTop: 10 }}>
@@ -1244,16 +1627,17 @@ export default function App() {
             </div>
             <div style={S.legendRow}>
               {local.vendedores.map((v) => (
-                <span key={v.id} style={S.legendChip}>
+                <span key={v.id} data-vendedor-id={v.id} style={S.legendChip}>
                   <span style={{ ...S.legendDot, background: v.color }} />
                   {v.nombre || "Sin nombre"}
                 </span>
               ))}
-              <span style={S.legendChip}>
+              {/* No le sirven a un vendedor que recibe la imagen/PDF, son datos para el local. */}
+              <span className="no-imprimir" style={S.legendChip}>
                 <span style={S.gapDot} />
                 Hueco sin cubrir
               </span>
-              <span style={S.legendChip}>
+              <span className="no-imprimir" style={S.legendChip}>
                 <span style={S.feriadoDot} />
                 Feriado nacional
               </span>
@@ -1261,7 +1645,8 @@ export default function App() {
           </div>
         </div>
 
-        {/* Columna derecha: horario del día seleccionado + reparto del mes */}
+        {/* Columna derecha: horario del día seleccionado + reparto del mes (se pliega con el ☰) */}
+        {panelesAbiertos && (
         <div className="card-derecha">
           <TurnoEditorCard
             vendedor={vActivo}
@@ -1301,7 +1686,7 @@ export default function App() {
               {[...filas]
                 .sort((a, b) => b.pct - a.pct)
                 .map((f, i) => (
-                  <div key={f.id} style={i === 0 ? S.rankCardTop : S.rankCard}>
+                  <div key={f.id} className="rankFila" style={i === 0 ? S.rankCardTop : S.rankCard}>
                     <div style={S.rankBadge}>
                       <span style={{ ...S.rankDot, background: f.color }} />
                     </div>
@@ -1331,7 +1716,18 @@ export default function App() {
             )}
           </div>
         </div>
+        )}
       </div>
+
+      {toast && (
+        <div className="toast no-imprimir" role="status">
+          <span>{toast.mensaje}</span>
+          {toast.deshacible && (
+            <button onClick={deshacerDesdeToast} className="toastDeshacer" style={S.toastDeshacerBtn}>Deshacer</button>
+          )}
+          <button onClick={() => setToast(null)} style={S.toastCerrarBtn} title="Cerrar" aria-label="Cerrar aviso">×</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1406,6 +1802,83 @@ function HorarioEspecialPicker({ local, onAgregar }) {
   );
 }
 
+// Para cargar "Fulano se toma 2 semanas desde el 10/11": elige vendedor + fecha de inicio +
+// cantidad de semanas, y muestra en vivo hasta qué fecha (inclusive) queda de vacaciones.
+function VacacionesPicker({ local, onAgregar }) {
+  const vendedores = local.vendedores;
+  const [vendedorId, setVendedorId] = useState(vendedores[0]?.id || "");
+  const [inicio, setInicio] = useState("");
+  const [semanas, setSemanas] = useState(1);
+
+  if (vendedores.length === 0) return null;
+
+  const vendedorIdActual = vendedores.some((v) => v.id === vendedorId) ? vendedorId : vendedores[0].id;
+  const fin = inicio ? finDeVacaciones(inicio, semanas) : null;
+
+  return (
+    <div style={{ marginTop: 6 }}>
+      <select value={vendedorIdActual} onChange={(e) => setVendedorId(e.target.value)} style={{ ...S.input, marginBottom: 6 }}>
+        {vendedores.map((v) => (
+          <option key={v.id} value={v.id}>{v.nombre || "Sin nombre"}</option>
+        ))}
+      </select>
+      <div style={S.twoCol}>
+        <input type="date" value={inicio} onChange={(e) => setInicio(e.target.value)} style={S.input} />
+        <select value={semanas} onChange={(e) => setSemanas(Number(e.target.value))} style={S.input}>
+          {Array.from({ length: 12 }, (_, i) => i + 1).map((n) => (
+            <option key={n} value={n}>{n} semana{n > 1 ? "s" : ""}</option>
+          ))}
+        </select>
+      </div>
+      {fin && <div style={{ ...S.notePlainSinMargen, marginTop: 6 }}>Hasta el {fmtFechaCorta(fin)} (inclusive)</div>}
+      <button
+        onClick={() => {
+          if (!inicio) return;
+          onAgregar(vendedorIdActual, inicio, semanas);
+          setInicio("");
+          setSemanas(1);
+        }}
+        style={{ ...S.copyBtn, marginTop: 6 }}
+      >+ Agregar vacaciones</button>
+    </div>
+  );
+}
+
+// Franco fijo: elegí el vendedor y togglear los días de la semana que libra siempre — mismo
+// formato de chips que "Días cerrados fijos" del local, pero por vendedor.
+function FrancoPicker({ local, onToggle }) {
+  const vendedores = local.vendedores;
+  const [vendedorId, setVendedorId] = useState(vendedores[0]?.id || "");
+
+  if (vendedores.length === 0) return null;
+
+  const vendedorIdActual = vendedores.some((v) => v.id === vendedorId) ? vendedorId : vendedores[0].id;
+  const vendedorActual = vendedores.find((v) => v.id === vendedorIdActual);
+
+  return (
+    <div style={{ marginTop: 6 }}>
+      <select value={vendedorIdActual} onChange={(e) => setVendedorId(e.target.value)} style={{ ...S.input, marginBottom: 6 }}>
+        {vendedores.map((v) => (
+          <option key={v.id} value={v.id}>{v.nombre || "Sin nombre"}</option>
+        ))}
+      </select>
+      <div style={S.cerradosChipRow}>
+        {DIAS_SEMANA.map((w, i) => {
+          const wd = JS_WEEKDAY_DE_INDICE[i];
+          const activo = (vendedorActual?.francos || []).includes(wd);
+          return (
+            <button
+              key={i}
+              onClick={() => onToggle(vendedorIdActual, wd)}
+              style={activo ? S.cerradoChipActivo : S.cerradoChip}
+            >{w}</button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // Calendario mensual: para TODOS los vendedores del local, un resumen compacto de los turnos
 // cargados cada día (nombre + horario, con una tira fina proporcional al horario del local
 // debajo). Marca el día actual, los días cerrados (fijos o feriados) y los huecos de cobertura.
@@ -1426,6 +1899,14 @@ function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, lo
     const hoy = esHoy(year, month, d);
     const horarioDia = horarioDelDia(local, year, month, d);
     const tieneHueco = !cerrado && huecosDelDia(vendedores, key, horarioDia.inicio, horarioDia.fin).length > 0;
+    // Defensivo: un vendedor de vacaciones no debería tener turnos cargados ese día (se borran al
+    // cargar la vacación), pero por las dudas no se duplica si ya está en `entradas`.
+    const vacacionesHoy = vendedoresDeVacaciones(vendedores, year, month, d).filter(
+      (v) => !entradas.some((e) => e.v.id === v.id)
+    );
+    const francoHoy = vendedoresDeFranco(vendedores, year, month, d).filter(
+      (v) => !entradas.some((e) => e.v.id === v.id) && !vacacionesHoy.some((e) => e.id === v.id)
+    );
 
     let cellStyle = S.dayCell;
     if (seleccionado) cellStyle = S.dayCellSelected;
@@ -1455,16 +1936,50 @@ function SharedCalendar({ year, month, nDias, leadBlanks, prefix, vendedores, lo
         {visibles.map(({ v, dia }) => {
           const primerNombre = (v.nombre || "Sin nombre").split(" ")[0];
           return (
+            // El nombre va en --ink (no en el color del vendedor): sobre el gris de la celda,
+            // varios de los colores de la paleta (flamingo, sage) quedaban por debajo del
+            // contraste mínimo legible. El puntito de color alcanza para identificar a quién
+            // corresponde cada línea, igual que en la leyenda de abajo del calendario.
             <span
               key={v.id}
-              style={{ ...S.turnoTextLabel, color: v.color }}
+              data-vendedor-id={v.id}
+              style={S.turnoTextLabel}
               title={`${v.nombre || "Sin nombre"}: ${fmtResumenDia(dia)}`}
             >
-              {primerNombre} {fmtResumenDia(dia)}
+              <span style={{ ...S.turnoDot, background: v.color }} />
+              <span style={S.turnoTextInner}>{primerNombre} {fmtResumenDia(dia)}</span>
             </span>
           );
         })}
         {resto > 0 && <span style={S.moreBadge}>+{resto} más</span>}
+        {vacacionesHoy.map((v) => {
+          const primerNombre = (v.nombre || "Sin nombre").split(" ")[0];
+          return (
+            <span
+              key={"vac-" + v.id}
+              data-vendedor-id={v.id}
+              style={S.turnoTextLabel}
+              title={`${v.nombre || "Sin nombre"}: de vacaciones`}
+            >
+              <span style={{ ...S.turnoDot, background: v.color }} />
+              <span style={S.vacacionTextInner}>{primerNombre} de vacaciones</span>
+            </span>
+          );
+        })}
+        {francoHoy.map((v) => {
+          const primerNombre = (v.nombre || "Sin nombre").split(" ")[0];
+          return (
+            <span
+              key={"franco-" + v.id}
+              data-vendedor-id={v.id}
+              style={S.turnoTextLabel}
+              title={`${v.nombre || "Sin nombre"}: franco`}
+            >
+              <span style={{ ...S.turnoDot, background: v.color }} />
+              <span style={S.francoTextInner}>{primerNombre} franco</span>
+            </span>
+          );
+        })}
       </button>
     );
   }
@@ -1530,9 +2045,9 @@ function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFech
       style={{ ...S.semanaScroll, maxHeight: "calc(100vh - 160px)", overflowY: "auto" }}
     >
       <div style={{ minWidth: anchoMin }}>
-        <div style={{ display: "flex", position: "sticky", top: 0, zIndex: 2, background: CARD, paddingBottom: 2 }}>
+        <div className="semanaHeaderSticky" style={{ display: "flex", position: "sticky", top: 0, zIndex: 2, background: CARD, paddingBottom: 2 }}>
           <div style={S.semanaAxisSpacer} />
-          <div style={{ display: "grid", gridTemplateColumns: `repeat(${dias.length}, 1fr)`, flex: 1, gap: 2 }}>
+          <div className="diasGridLineas" style={{ display: "grid", gridTemplateColumns: `repeat(${dias.length}, minmax(0, 1fr))`, flex: 1, gap: 10 }}>
             {dias.map((fecha, i) => {
               const y = fecha.getFullYear(), m = fecha.getMonth() + 1, d = fecha.getDate();
               const key = dateKey(y, m, d);
@@ -1572,11 +2087,15 @@ function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFech
               </div>
             ))}
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: `repeat(${dias.length}, 1fr)`, flex: 1, gap: 2, position: "relative" }}>
+          <div className="diasGridLineas" style={{ display: "grid", gridTemplateColumns: `repeat(${dias.length}, minmax(0, 1fr))`, flex: 1, gap: 10, position: "relative" }}>
             {dias.map((fecha, i) => {
               const y = fecha.getFullYear(), m = fecha.getMonth() + 1, d = fecha.getDate();
               const key = dateKey(y, m, d);
               const cerrado = estaCerrado(local, y, m, d);
+              const vacacionesHoy = vendedoresDeVacaciones(vendedores, y, m, d);
+              const francoHoy = vendedoresDeFranco(vendedores, y, m, d).filter(
+                (v) => !vacacionesHoy.some((e) => e.id === v.id)
+              );
               const eventos = [];
               vendedores.forEach((v) => {
                 (v.dias[key]?.turnos || []).forEach((t, idx) => {
@@ -1606,6 +2125,26 @@ function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFech
                       <span style={S.semanaAhoraDot} />
                     </div>
                   )}
+                  {vacacionesHoy.length > 0 && (
+                    <div
+                      style={S.semanaVacacionesBanda}
+                      title={`De vacaciones: ${vacacionesHoy.map((v) => v.nombre || "Sin nombre").join(", ")}`}
+                    >
+                      {vacacionesHoy.map((v) => (
+                        <span key={v.id} style={{ ...S.semanaVacacionesDot, background: v.color }} />
+                      ))}
+                    </div>
+                  )}
+                  {francoHoy.length > 0 && (
+                    <div
+                      style={{ ...S.semanaFrancoBanda, top: vacacionesHoy.length > 0 ? 12 : 2 }}
+                      title={`Franco: ${francoHoy.map((v) => v.nombre || "Sin nombre").join(", ")}`}
+                    >
+                      {francoHoy.map((v) => (
+                        <span key={v.id} style={{ ...S.semanaFrancoDot, background: v.color }} />
+                      ))}
+                    </div>
+                  )}
                   {dispuestos.map((ev) => {
                     // Se recorta 1px arriba y abajo (igual que el "- 3px" del ancho, para las
                     // columnas lado a lado) para que se note un corte entre dos turnos seguidos
@@ -1617,6 +2156,7 @@ function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFech
                     return (
                       <button
                         key={ev.vId + "-" + ev.idx}
+                        data-vendedor-id={ev.vId}
                         onClick={(e) => { e.stopPropagation(); onSelectFecha({ year: y, month: m, day: d }); onSelectVendedor(ev.vId); }}
                         style={{ ...S.semanaEvento, top, height: alto, left: `${left}%`, width: `calc(${ancho}% - 3px)`, background: ev.color, color: colorTextoContraste(ev.color) }}
                         title={`${ev.nombre || "Sin nombre"}: ${fmtHoraCorta(minAHHMM(ev.inicioMin))}-${fmtHoraCorta(minAHHMM(ev.finMin))}`}
@@ -1640,24 +2180,10 @@ function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFech
 
 function VendedorEditor({ v, prefix, onChange, onCopiarMesAnterior, onRepetirSemana, onCopiarSemanaAnterior, onRemove, canRemove, horasCalc }) {
   const diasMarcados = Object.keys(v.dias).filter((k) => k.startsWith(prefix)).length;
-  const [msg, setMsg] = useState("");
 
-  const handleCopiar = () => {
-    const n = onCopiarMesAnterior();
-    setMsg(n > 0 ? `Se copiaron ${n} días del mes anterior` : "No hay días el mes pasado para copiar");
-    setTimeout(() => setMsg(""), 2500);
-  };
-  const handleRepetir = () => {
-    const n = onRepetirSemana();
-    setMsg(n > 0 ? `Se repitieron ${n} días según la primera semana` : "Cargá al menos un día en la primera semana (1 al 7) para repetir");
-    setTimeout(() => setMsg(""), 2500);
-  };
-  const handleCopiarSemana = () => {
-    const n = onCopiarSemanaAnterior();
-    setMsg(n > 0 ? `Se copiaron ${n} días de la semana anterior` : "No hay datos la semana anterior para copiar");
-    setTimeout(() => setMsg(""), 2500);
-  };
-
+  // El aviso de cada acción ("se copiaron N días", "no hay nada para copiar") ahora lo muestra
+  // el toast único de App (ver mostrarToast) — estos botones llaman directo a la función de App,
+  // sin manejar su propio mensaje/timeout como antes.
   return (
     <div>
       <div style={S.rowBetween}>
@@ -1674,11 +2200,10 @@ function VendedorEditor({ v, prefix, onChange, onCopiarMesAnterior, onRepetirSem
 
       <div style={S.miniStat}>{diasMarcados} días marcados · {fmt(horasCalc, 1)} hs este mes</div>
       <div style={S.rowBetween3}>
-        <button onClick={handleCopiar} style={S.copyBtn}>Copiar mes anterior</button>
-        <button onClick={handleRepetir} style={S.copyBtn}>Repetir 1ª semana</button>
-        <button onClick={handleCopiarSemana} style={S.copyBtn}>Copiar semana anterior</button>
+        <button onClick={onCopiarMesAnterior} style={S.copyBtn}>Copiar mes anterior</button>
+        <button onClick={onRepetirSemana} style={S.copyBtn}>Repetir 1ª semana</button>
+        <button onClick={onCopiarSemanaAnterior} style={S.copyBtn}>Copiar semana anterior</button>
       </div>
-      {msg && <div style={S.copiadoMsg}>{msg}</div>}
     </div>
   );
 }
@@ -1691,7 +2216,6 @@ function TurnoEditorCard({
 }) {
   if (!vendedor) return null;
 
-  const [msgDia, setMsgDia] = useState("");
   const haySeleccionMultiple = diasSeleccionadosParaCopiar > 0;
   const mostrarBotonesCopiar = !!fecha || haySeleccionMultiple;
 
@@ -1701,18 +2225,8 @@ function TurnoEditorCard({
     onCambiarFecha({ year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate() });
   };
 
-  const handleCopiarDia = () => {
-    const cantidad = haySeleccionMultiple ? diasSeleccionadosParaCopiar : 1;
-    onCopiarDia();
-    setMsgDia(cantidad === 1 ? "Día copiado" : `${cantidad} días copiados`);
-    setTimeout(() => setMsgDia(""), 2000);
-  };
-  const handlePegarDia = () => {
-    const n = onPegarDia();
-    setMsgDia(n > 0 ? (n === 1 ? "Se pegó 1 día" : `Se pegaron ${n} días`) : "No hay nada copiado para pegar");
-    setTimeout(() => setMsgDia(""), 2500);
-  };
-
+  // El aviso de "día copiado" / "se pegaron N días" ahora lo muestra el toast único de App
+  // (copiarDias/pegarDias ya llaman a mostrarToast); acá solo se dispara la acción.
   const cerrado = fecha ? estaCerrado(local, fecha.year, fecha.month, fecha.day) : false;
   const feriado = fecha ? feriadosArgentina(fecha.year)[dateKey(fecha.year, fecha.month, fecha.day)] : null;
   const horarioDia = fecha ? horarioDelDia(local, fecha.year, fecha.month, fecha.day) : null;
@@ -1740,14 +2254,14 @@ function TurnoEditorCard({
       {mostrarBotonesCopiar && (
         <>
           <div style={S.rowBetween3}>
-            <button onClick={handleCopiarDia} style={S.copyBtn}>
+            <button onClick={onCopiarDia} style={S.copyBtn}>
               {haySeleccionMultiple ? `Copiar ${diasSeleccionadosParaCopiar} días seleccionados` : "Copiar este día"}
             </button>
             {haySeleccionMultiple && (
               <button onClick={onLimpiarSeleccion} style={S.copyBtnDisabled} title="Cancelar la selección de días">✕</button>
             )}
             <button
-              onClick={handlePegarDia}
+              onClick={onPegarDia}
               disabled={!copiaDisponible || !fecha}
               style={copiaDisponible && fecha ? S.copyBtn : S.copyBtnDisabled}
             >
@@ -1761,7 +2275,6 @@ function TurnoEditorCard({
               Elegí más días con Ctrl+clic (o Cmd+clic), o tocá "Copiar" para juntarlos ya.
             </div>
           )}
-          {msgDia && <div style={S.copiadoMsg}>{msgDia}</div>}
         </>
       )}
 
@@ -1793,15 +2306,15 @@ function TurnoEditorCard({
       })()}
 
       {feriado && (
-        <div style={S.notePlain}>📅 Feriado nacional: {feriado}</div>
+        <div className="avisoDia" style={S.notePlain}>📅 Feriado nacional: {feriado}</div>
       )}
 
       {cerrado && (
-        <div style={S.notePlain}>Este día el local figura cerrado. Igual podés cargar un horario si hace falta (ej. reposición).</div>
+        <div className="avisoDia" style={S.notePlain}>Este día el local figura cerrado. Igual podés cargar un horario si hace falta (ej. reposición).</div>
       )}
 
       {huecos.length > 0 && (
-        <div style={S.gapWarning}>
+        <div className="avisoDia" style={S.gapWarning}>
           ⚠ Sin cobertura de nadie: {huecos.map((h) => `${h.inicio}–${h.fin}`).join(", ")}
         </div>
       )}
@@ -1822,6 +2335,20 @@ function TurnoEditorCard({
 }
 
 function TurnoEditorDia({ vendedor, local, fecha, onSetTurnos, onQuitarDia }) {
+  if (estaDeVacaciones(vendedor, fecha.year, fecha.month, fecha.day)) {
+    return (
+      <div style={S.vacacionBloqueoAviso}>
+        🏖 {vendedor.nombre || "Este vendedor"} está de vacaciones este día. No se puede cargar horario.
+      </div>
+    );
+  }
+  if (esFrancoVendedor(vendedor, fecha.year, fecha.month, fecha.day)) {
+    return (
+      <div style={S.francoBloqueoAviso}>
+        🛌 {vendedor.nombre || "Este vendedor"} tiene franco fijo este día. No se puede cargar horario.
+      </div>
+    );
+  }
   const key = dateKey(fecha.year, fecha.month, fecha.day);
   const turnos = vendedor.dias[key]?.turnos || [];
   const horarioDia = horarioDelDia(local, fecha.year, fecha.month, fecha.day);
@@ -1912,10 +2439,18 @@ const S = {
     // Roboto es la que usa Google Calendar/Workspace en la web; si por lo que sea no llega a
     // cargar (sin internet, bloqueada), cae en la misma pila de fuentes del sistema de antes.
     fontFamily: "'Roboto', -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif",
-    padding: "24px 20px 48px", maxWidth: 1460, margin: "0 auto",
+    // Antes el máximo era un valor fijo (1460px): en una notebook (viewport típico
+    // 1366–1440px) eso ya ocupaba todo el ancho y se veía bien, pero en un monitor de 27" (2560px
+    // de ancho o más) dejaba más de 500px vacíos de cada lado. Los paneles laterales son de ancho
+    // fijo (280/300px, ver .appGrid más abajo), así que todo ese espacio extra iría al calendario
+    // del medio — el que más se beneficia de tener más lugar. Con "min(...)" se adapta solo al
+    // ancho de cada pantalla: en monitores grandes crece hasta 2200px (después de eso un
+    // ultrawide dejaría columnas de día absurdamente anchas), y en pantallas chicas no hace nada
+    // porque el 98vw ya da menos que eso.
+    padding: "24px 20px 48px", maxWidth: "min(2200px, 98vw)", margin: "0 auto",
   },
   loadingWrap: { minHeight: "100vh", background: BG, display: "flex", alignItems: "center", justifyContent: "center" },
-  loadingDot: { width: 10, height: 10, borderRadius: 99, background: ACCENT, animation: "pulse 1s infinite ease-in-out" },
+  loadingDot: { width: 10, height: 10, borderRadius: 999, background: ACCENT, animation: "pulse 1s infinite ease-in-out" },
   headerBand: {
     background: CARD, borderRadius: 16, padding: "9px 12px", marginBottom: 10,
     boxShadow: "0 1px 2px rgba(0,0,0,0.04), 0 8px 20px -12px rgba(0,0,0,0.08)",
@@ -1925,37 +2460,58 @@ const S = {
   headerRightRow: { display: "flex", alignItems: "center", gap: 8 },
   logoRow: { display: "flex", alignItems: "center", gap: 7 },
   logoMark: {
-    width: 26, height: 26, borderRadius: 7, background: ACCENT, color: "#fff",
-    display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 800, letterSpacing: "-0.02em",
+    width: 26, height: 26, borderRadius: 8, background: ACCENT, color: "#fff",
+    display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, letterSpacing: "-0.02em",
     flexShrink: 0,
   },
-  brandTitle: { fontSize: 13.5, fontWeight: 800, letterSpacing: "-0.01em", lineHeight: 1.1, color: INK },
-  brandSubtitle: { fontSize: 8.5, fontWeight: 700, letterSpacing: "0.05em", color: SUB, marginTop: 0 },
+  brandTitle: { fontSize: 13, fontWeight: 800, letterSpacing: "-0.01em", lineHeight: 1.1, color: INK },
+  brandSubtitle: { fontSize: 10, fontWeight: 700, letterSpacing: "0.05em", color: SUB, marginTop: 0 },
   savedPill: {
-    display: "flex", alignItems: "center", gap: 3, fontSize: 10.5, fontWeight: 700,
+    display: "flex", alignItems: "center", gap: 3, fontSize: 11, fontWeight: 700,
     color: GOOD, transition: "opacity 0.5s ease",
   },
-  syncBadgeOn: { fontSize: 9.5, fontWeight: 700, color: ACCENT },
-  syncBadgeOff: { fontSize: 9.5, fontWeight: 700, color: SUB },
+  errorPill: {
+    display: "flex", alignItems: "center", gap: 3, fontSize: 11, fontWeight: 700,
+    color: DANGER, background: DANGER_BG, border: "none", borderRadius: 999,
+    padding: "3px 9px", cursor: "pointer", whiteSpace: "nowrap",
+  },
+  toastDeshacerBtn: {
+    // El color de "Deshacer" lo pone la clase .toastDeshacer del CSS (no acá): el toast
+    // invierte los colores del tema (fondo oscuro en modo claro y viceversa), así que necesita
+    // su propio acento por tema en vez de heredar el --accent de la página.
+    fontSize: 12.5, fontWeight: 800,
+    background: "transparent", border: "none", cursor: "pointer", padding: "4px 2px", whiteSpace: "nowrap",
+  },
+  toastCerrarBtn: {
+    fontSize: 15, lineHeight: 1, color: "inherit", opacity: 0.6, background: "transparent",
+    border: "none", cursor: "pointer", padding: "2px 4px", borderRadius: 999,
+  },
+  syncBadgeOn: { fontSize: 10, fontWeight: 700, color: ACCENT },
+  syncBadgeOff: { fontSize: 10, fontWeight: 700, color: SUB },
   undoBtn: {
-    fontSize: 11.5, fontWeight: 700, color: INK, background: SURFACE_2, border: "none",
+    fontSize: 12, fontWeight: 700, color: INK, background: SURFACE_2, border: "none",
     borderRadius: 8, padding: "5px 9px", cursor: "pointer", whiteSpace: "nowrap",
   },
   undoBtnDisabled: {
-    fontSize: 11.5, fontWeight: 700, color: SUB, background: "transparent", border: "none",
+    fontSize: 12, fontWeight: 700, color: SUB, background: "transparent", border: "none",
     borderRadius: 8, padding: "5px 9px", cursor: "default", opacity: 0.4, whiteSpace: "nowrap",
   },
   temaBtn: {
     width: 22, height: 22, borderRadius: 999, border: "none", background: "transparent",
     fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
   },
+  panelToggleBtn: {
+    width: 26, height: 26, borderRadius: 8, border: "none", background: SURFACE_2, color: INK,
+    fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+    padding: 0, flexShrink: 0,
+  },
   localDropdownWrap: { position: "relative", flex: "1 1 220px", maxWidth: 340, minWidth: 160 },
   localDropdownBtn: {
     width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
-    background: BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: "7px 11px",
+    background: BG, border: `1px solid ${LINE}`, borderRadius: 8, padding: "7px 11px",
     cursor: "pointer",
   },
-  localDropdownText: { fontSize: 13.5, fontWeight: 700, color: INK },
+  localDropdownText: { fontSize: 13, fontWeight: 700, color: INK },
   localDropdownList: {
     position: "absolute", top: "calc(100% + 6px)", left: 0, right: 0, zIndex: 10,
     background: CARD, border: `1px solid ${LINE}`, borderRadius: 12, padding: 6,
@@ -1970,54 +2526,54 @@ const S = {
     background: ACCENT_SOFT, border: "none", borderRadius: 8, padding: "9px 10px", cursor: "pointer", textAlign: "left",
   },
   localOptionAdd: {
-    display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, fontWeight: 600, color: SUB,
+    display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600, color: SUB,
     background: "transparent", border: "none", borderRadius: 8, padding: "9px 10px", cursor: "pointer", textAlign: "left",
     borderTop: `1px solid ${LINE}`, marginTop: 2,
   },
   chipRow: { display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 },
   chip: {
-    fontSize: 12.5, fontWeight: 600, color: SUB, background: CARD, border: `1px solid ${LINE}`,
+    fontSize: 12, fontWeight: 600, color: SUB, background: CARD, border: `1px solid ${LINE}`,
     borderRadius: 999, padding: "7px 12px", whiteSpace: "nowrap", flexShrink: 0, cursor: "pointer",
     display: "flex", alignItems: "center", gap: 6,
   },
   chipActiveAccent: {
-    fontSize: 12.5, fontWeight: 700, color: "#fff", border: "none",
+    fontSize: 12, fontWeight: 700, color: "#fff", border: "none",
     borderRadius: 999, padding: "7px 12px", whiteSpace: "nowrap", flexShrink: 0, cursor: "pointer",
     display: "flex", alignItems: "center", gap: 6,
   },
-  chipDot: { width: 7, height: 7, borderRadius: 99, flexShrink: 0, display: "inline-block" },
+  chipDot: { width: 7, height: 7, borderRadius: 999, flexShrink: 0, display: "inline-block" },
   card: {
-    background: CARD, borderRadius: 18, padding: 15,
+    background: CARD, borderRadius: 16, padding: 15,
     boxShadow: "0 1px 2px rgba(0,0,0,0.04), 0 8px 20px -12px rgba(0,0,0,0.08)",
   },
   rowBetween: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 10 },
   nameInput: { fontSize: 16, fontWeight: 700, border: "none", background: "transparent", outline: "none", color: INK, flex: 1 },
   nameInputSm: {
     fontSize: 14, fontWeight: 700, color: INK, flex: 1, outline: "none",
-    border: `1.5px solid ${LINE}`, borderRadius: 9, background: SURFACE_INPUT,
+    border: `1.5px solid ${LINE}`, borderRadius: 8, background: SURFACE_INPUT,
     padding: "8px 10px",
   },
   twoCol: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
   field: { display: "flex", flexDirection: "column", gap: 4 },
   label: { fontSize: 11, color: SUB, fontWeight: 600 },
   input: {
-    border: `1px solid ${LINE}`, borderRadius: 10, padding: "9px 10px", fontSize: 14,
+    border: `1px solid ${LINE}`, borderRadius: 8, padding: "9px 10px", fontSize: 14,
     color: INK, background: SURFACE_INPUT, outline: "none", width: "100%", boxSizing: "border-box",
   },
   iconGhost: {
     width: 28, height: 28, borderRadius: 8, border: "none", background: DANGER_BG, color: DANGER,
     display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0,
   },
-  sectionTitle: { fontSize: 15, fontWeight: 700, color: INK },
+  sectionTitle: { fontSize: 14, fontWeight: 700, color: INK },
   addBtn: {
-    display: "flex", alignItems: "center", gap: 4, fontSize: 12.5, fontWeight: 700, color: "#fff",
-    background: ACCENT, border: "none", borderRadius: 10, padding: "7px 11px", cursor: "pointer",
+    display: "flex", alignItems: "center", gap: 4, fontSize: 12, fontWeight: 700, color: "#fff",
+    background: ACCENT, border: "none", borderRadius: 8, padding: "7px 11px", cursor: "pointer",
   },
   smallGhostBtn: {
-    fontSize: 11.5, fontWeight: 600, color: SUB, background: SURFACE_2, border: "none",
+    fontSize: 12, fontWeight: 600, color: SUB, background: SURFACE_2, border: "none",
     borderRadius: 8, padding: "7px 10px", cursor: "pointer",
   },
-  miniStat: { fontSize: 11.5, color: SUB, fontWeight: 600, marginTop: 4 },
+  miniStat: { fontSize: 12, color: SUB, fontWeight: 600, marginTop: 4 },
   monthNav: { display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" },
   navBtn: {
     width: 28, height: 28, borderRadius: 999, border: `1px solid ${LINE}`, background: SURFACE_INPUT,
@@ -2028,40 +2584,57 @@ const S = {
     color: INK, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0,
   },
   hoyBtn: {
-    fontSize: 11.5, fontWeight: 700, color: ACCENT, background: ACCENT_SOFT, border: "none",
+    fontSize: 12, fontWeight: 700, color: ACCENT, background: ACCENT_SOFT, border: "none",
     borderRadius: 999, padding: "6px 13px", cursor: "pointer", marginLeft: 4,
   },
   monthLabel: { fontSize: 14, fontWeight: 700, minWidth: 120, textAlign: "center", color: INK },
   vistaSwitchRow: { display: "flex", gap: 4, flexShrink: 0 },
   encabezadoImpresion: { marginBottom: 10 },
   vistaBtn: {
-    fontSize: 11.5, fontWeight: 700, color: SUB, background: SURFACE_2, border: "none",
+    fontSize: 12, fontWeight: 700, color: SUB, background: SURFACE_2, border: "none",
     borderRadius: 8, padding: "6px 10px", cursor: "pointer",
+  },
+  compartirMenuWrap: { position: "relative" },
+  compartirMenuPanel: {
+    position: "absolute", top: "calc(100% + 6px)", right: 0, zIndex: 10, width: 230,
+    background: CARD, border: `1px solid ${LINE}`, borderRadius: 12, padding: 10,
+    boxShadow: "0 10px 24px -8px rgba(0,0,0,0.18)", display: "flex", flexDirection: "column", gap: 8,
+  },
+  compartirMenuTitulo: { fontSize: 11, fontWeight: 700, color: SUB, textTransform: "uppercase", letterSpacing: "0.03em" },
+  compartirMenuLabel: { display: "flex", flexDirection: "column", gap: 4, fontSize: 12, fontWeight: 600, color: SUB },
+  compartirMenuSelect: {
+    border: `1px solid ${LINE}`, borderRadius: 8, padding: "7px 8px", fontSize: 13,
+    color: INK, background: SURFACE_INPUT, outline: "none", width: "100%", boxSizing: "border-box",
+  },
+  compartirMenuBtn: {
+    display: "flex", alignItems: "center", gap: 7, fontSize: 12.5, fontWeight: 700, color: INK,
+    background: SURFACE_2, border: "none", borderRadius: 8, padding: "9px 10px", cursor: "pointer",
+    width: "100%", textAlign: "left",
   },
   vistaBtnActive: {
-    fontSize: 11.5, fontWeight: 700, color: "#fff", background: ACCENT, border: "none",
+    fontSize: 12, fontWeight: 700, color: "#fff", background: ACCENT, border: "none",
     borderRadius: 8, padding: "6px 10px", cursor: "pointer",
   },
-  weekHeader: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", marginBottom: 4 },
-  weekHeaderCell: { fontSize: 10.5, color: SUB, fontWeight: 700, textAlign: "center" },
-  grid: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 5 },
+  weekHeader: { display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", marginBottom: 4 },
+  weekHeaderCell: { fontSize: 11, color: SUB, fontWeight: 700, textAlign: "center" },
+  grid: { display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 5 },
   dayCell: {
-    minHeight: 86, border: "none", borderRadius: 10, background: SURFACE_2, color: INK,
+    minHeight: 86, border: "none", borderRadius: 12, background: SURFACE_2, color: INK,
     cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "stretch",
     justifyContent: "flex-start", padding: "5px 4px", gap: 3, textAlign: "left", boxSizing: "border-box",
   },
   dayCellSelected: {
-    minHeight: 86, border: `1.5px solid ${ACCENT}`, borderRadius: 10, background: ACCENT_SOFT, color: INK,
+    minHeight: 86, border: `1.5px solid ${ACCENT}`, borderRadius: 12, background: ACCENT_SOFT, color: INK,
     cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "stretch",
     justifyContent: "flex-start", padding: "4.5px 3.5px", gap: 3, textAlign: "left", boxSizing: "border-box",
   },
   dayCellHoy: {
-    minHeight: 86, border: `1.5px solid ${ACCENT}`, borderRadius: 10, background: SURFACE_2, color: INK,
+    minHeight: 86, border: `1.5px solid ${ACCENT}`, borderRadius: 12, background: SURFACE_2, color: INK,
     cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "stretch",
     justifyContent: "flex-start", padding: "4.5px 3.5px", gap: 3, textAlign: "left", boxSizing: "border-box",
   },
   dayCellCerrado: {
-    minHeight: 86, border: "none", borderRadius: 10, color: SUB,
+    minHeight: 86, border: "none", borderRadius: 12, color: SUB,
     background: `repeating-linear-gradient(135deg, ${SURFACE_2}, ${SURFACE_2} 6px, transparent 6px, transparent 12px), ${CARD}`,
     cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "stretch",
     justifyContent: "flex-start", padding: "5px 4px", gap: 3, textAlign: "left", boxSizing: "border-box",
@@ -2069,88 +2642,101 @@ const S = {
   dayNumRow: { fontSize: 11, fontWeight: 700, color: INK, padding: "0 2px", display: "flex", alignItems: "center", gap: 3 },
   dayNumRowHoy: { fontSize: 11, fontWeight: 800, color: ACCENT, padding: "0 2px", display: "flex", alignItems: "center", gap: 3 },
   dayNumRowCerrado: { fontSize: 11, fontWeight: 700, color: SUB, padding: "0 2px", display: "flex", alignItems: "center", gap: 3 },
-  cerradoLabel: { fontSize: 8.5, fontWeight: 700, color: SUB, padding: "0 2px" },
-  feriadoDot: { width: 5, height: 5, borderRadius: 99, background: "var(--feriado)", flexShrink: 0, display: "inline-block" },
-  feriadoLabel: { fontSize: 8.5, fontWeight: 700, color: "var(--feriado)", padding: "0 2px" },
+  cerradoLabel: { fontSize: 10, fontWeight: 700, color: SUB, padding: "0 2px" },
+  feriadoDot: { width: 5, height: 5, borderRadius: 999, background: "var(--feriado)", flexShrink: 0, display: "inline-block" },
+  feriadoLabel: { fontSize: 10, fontWeight: 700, color: "var(--feriado)", padding: "0 2px" },
   turnoTextLabel: {
-    display: "block", width: "100%", flexShrink: 0,
-    fontSize: 9, fontWeight: 700, lineHeight: 1.35,
+    display: "flex", alignItems: "center", gap: 3, width: "100%", flexShrink: 0, minWidth: 0,
+  },
+  turnoDot: { width: 6, height: 6, borderRadius: 999, flexShrink: 0, display: "inline-block" },
+  turnoTextInner: {
+    fontSize: 10, fontWeight: 700, lineHeight: 1.35, color: INK, minWidth: 0,
     whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
   },
-  moreBadge: { fontSize: 8, fontWeight: 700, color: SUB, padding: "0 3px" },
-  gapDot: { width: 5, height: 5, borderRadius: 99, background: WARN, flexShrink: 0, display: "inline-block" },
+  vacacionTextInner: {
+    fontSize: 10, fontWeight: 700, lineHeight: 1.35, color: "var(--vacaciones)", minWidth: 0,
+    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", fontStyle: "italic",
+  },
+  francoTextInner: {
+    fontSize: 10, fontWeight: 700, lineHeight: 1.35, color: SUB, minWidth: 0,
+    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+  },
+  moreBadge: { fontSize: 10, fontWeight: 700, color: SUB, padding: "0 3px" },
+  gapDot: { width: 5, height: 5, borderRadius: 999, background: WARN, flexShrink: 0, display: "inline-block" },
   // Días marcados con Ctrl/Cmd+clic para copiarlos juntos: un aro de color aparte (no pisa el
   // borde de "seleccionado" ni el tamaño de la celda, va por afuera con boxShadow).
   diaMarcadoParaCopiar: { boxShadow: "0 0 0 2px var(--multicopia) inset" },
   multicopiaCheck: {
     display: "inline-flex", alignItems: "center", justifyContent: "center", width: 12, height: 12,
-    borderRadius: 99, background: "var(--multicopia)", color: "#fff", fontSize: 8, fontWeight: 800, lineHeight: 1,
+    borderRadius: 999, background: "var(--multicopia)", color: "#fff", fontSize: 8, fontWeight: 800, lineHeight: 1,
   },
   gapWarning: {
-    fontSize: 11.5, fontWeight: 600, color: WARN, background: WARN_BG, borderRadius: 9,
+    fontSize: 12, fontWeight: 600, color: WARN, background: WARN_BG, borderRadius: 8,
     padding: "8px 10px", marginBottom: 10, lineHeight: 1.4,
   },
+  vacacionBloqueoAviso: { fontSize: 13, fontWeight: 700, color: "var(--vacaciones)", lineHeight: 1.4, padding: "10px 0" },
+  francoBloqueoAviso: { fontSize: 13, fontWeight: 700, color: SUB, lineHeight: 1.4, padding: "10px 0" },
   legendRow: { display: "flex", flexWrap: "wrap", gap: 10, marginTop: 12, paddingTop: 10, borderTop: `1px solid ${LINE}` },
   legendChip: { display: "flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 600, color: SUB },
-  legendDot: { width: 8, height: 8, borderRadius: 99, flexShrink: 0, display: "inline-block" },
+  legendDot: { width: 8, height: 8, borderRadius: 999, flexShrink: 0, display: "inline-block" },
   rowBetween3: { display: "flex", alignItems: "center", gap: 8, marginTop: 8, flexWrap: "wrap" },
   copyBtn: {
     fontSize: 11, fontWeight: 700, color: ACCENT, background: ACCENT_SOFT, border: "none",
-    borderRadius: 7, padding: "6px 10px", cursor: "pointer", whiteSpace: "nowrap",
+    borderRadius: 8, padding: "6px 10px", cursor: "pointer", whiteSpace: "nowrap",
   },
   copyBtnDisabled: {
     fontSize: 11, fontWeight: 700, color: SUB, background: SURFACE_2, border: "none",
-    borderRadius: 7, padding: "6px 10px", cursor: "default", whiteSpace: "nowrap", opacity: 0.6,
+    borderRadius: 8, padding: "6px 10px", cursor: "default", whiteSpace: "nowrap", opacity: 0.6,
   },
   copiadoMsg: { fontSize: 11, color: ACCENT, fontWeight: 600, marginTop: 6 },
-  note: { fontSize: 11.5, color: DANGER, lineHeight: 1.4 },
-  notePlain: { fontSize: 11.5, color: SUB, lineHeight: 1.4, marginBottom: 10 },
-  eyebrowLine: { fontSize: 10.5, fontWeight: 700, color: SUB, marginBottom: 2 },
+  note: { fontSize: 12, color: DANGER, lineHeight: 1.4 },
+  notePlain: { fontSize: 12, color: SUB, lineHeight: 1.4, marginBottom: 10 },
+  eyebrowLine: { fontSize: 11, fontWeight: 700, color: SUB, marginBottom: 2 },
   turnoEditorTitle: { display: "flex", alignItems: "center", gap: 7, fontSize: 14, fontWeight: 700, color: INK },
   diaResumenBlock: {
-    display: "flex", flexDirection: "column", gap: 5, background: SURFACE_2, borderRadius: 10,
+    display: "flex", flexDirection: "column", gap: 5, background: SURFACE_2, borderRadius: 12,
     padding: "8px 10px", marginTop: 10, marginBottom: 10,
   },
-  diaResumenRow: { display: "flex", alignItems: "center", gap: 6, fontSize: 11.5 },
+  diaResumenRow: { display: "flex", alignItems: "center", gap: 6, fontSize: 12 },
   diaResumenNombre: { fontWeight: 700, color: INK, flexShrink: 0 },
   diaResumenHoras: { color: SUB, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-  diaResumenSinHorario: { fontSize: 10.5, color: SUB, fontWeight: 600, marginTop: 4, paddingTop: 5, borderTop: `1px solid ${LINE}` },
-  notePlainSinMargen: { fontSize: 11.5, color: SUB, lineHeight: 1.4 },
+  diaResumenSinHorario: { fontSize: 11, color: SUB, fontWeight: 600, marginTop: 4, paddingTop: 5, borderTop: `1px solid ${LINE}` },
+  notePlainSinMargen: { fontSize: 12, color: SUB, lineHeight: 1.4 },
   dayNavRow: { display: "flex", alignItems: "center", gap: 6 },
-  dayNavLabel: { fontSize: 11.5, fontWeight: 700, color: INK, minWidth: 56, textAlign: "center" },
+  dayNavLabel: { fontSize: 12, fontWeight: 700, color: INK, minWidth: 56, textAlign: "center" },
   turnoRow: { display: "flex", alignItems: "center", gap: 6, marginBottom: 8 },
   turnoSelect: {
-    flex: 1, border: `1px solid ${LINE}`, borderRadius: 9, padding: "8px 6px", fontSize: 13,
+    flex: 1, border: `1px solid ${LINE}`, borderRadius: 8, padding: "8px 6px", fontSize: 13,
     color: INK, background: SURFACE_INPUT, outline: "none", minWidth: 0,
   },
-  turnoA: { fontSize: 11.5, color: SUB, fontWeight: 600, flexShrink: 0 },
+  turnoA: { fontSize: 12, color: SUB, fontWeight: 600, flexShrink: 0 },
   rankList: { display: "flex", flexDirection: "column", gap: 8 },
   rankCard: {
-    display: "flex", alignItems: "center", gap: 10, background: BG, borderRadius: 14, padding: "10px 12px",
+    display: "flex", alignItems: "center", gap: 10, background: BG, borderRadius: 12, padding: "10px 12px",
   },
   rankCardTop: {
-    display: "flex", alignItems: "center", gap: 10, background: ACCENT_SOFT, borderRadius: 14, padding: "10px 12px",
+    display: "flex", alignItems: "center", gap: 10, background: ACCENT_SOFT, borderRadius: 12, padding: "10px 12px",
     border: `1.5px solid ${ACCENT}`,
   },
   rankBadge: { width: 26, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 },
-  rankDot: { width: 10, height: 10, borderRadius: 99, flexShrink: 0, display: "inline-block" },
+  rankDot: { width: 10, height: 10, borderRadius: 999, flexShrink: 0, display: "inline-block" },
   rankInfo: { flex: 1, minWidth: 0 },
-  rankName: { fontSize: 13.5, fontWeight: 700, color: INK, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  rankName: { fontSize: 13, fontWeight: 700, color: INK, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
   rankSub: { fontSize: 11, color: SUB, fontWeight: 500, marginTop: 1 },
   rankRight: { textAlign: "right", flexShrink: 0 },
-  rankPct: { fontSize: 15, fontWeight: 800, color: INK },
-  rankMoney: { fontSize: 10.5, color: SUB, fontWeight: 600, marginTop: 1 },
+  rankPct: { fontSize: 16, fontWeight: 800, color: INK },
+  rankMoney: { fontSize: 11, color: SUB, fontWeight: 600, marginTop: 1 },
   rowBetween2: {
     display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 10, paddingTop: 10,
     borderTop: `1px solid ${LINE}`,
   },
-  miniStatStrong: { fontSize: 12.5, fontWeight: 800, color: INK },
+  miniStatStrong: { fontSize: 12, fontWeight: 800, color: INK },
   cerradosBlock: { marginTop: 12, paddingTop: 12, borderTop: `1px solid ${LINE}` },
   configToggleBtn: {
     width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
     marginTop: 12, paddingTop: 12, paddingBottom: 2,
     borderWidth: 0, borderTopWidth: 1, borderTopStyle: "solid", borderTopColor: LINE,
-    background: "transparent", cursor: "pointer", color: SUB, fontSize: 12.5, fontWeight: 700,
+    background: "transparent", cursor: "pointer", color: SUB, fontSize: 12, fontWeight: 700,
   },
   cerradosChipRow: { display: "flex", gap: 5, marginTop: 6 },
   cerradoChip: {
@@ -2168,7 +2754,7 @@ const S = {
     background: SURFACE_2, borderRadius: 999, padding: "4px 4px 4px 10px",
   },
   feriadoRemove: {
-    width: 16, height: 16, borderRadius: 99, border: "none", background: "transparent", color: SUB,
+    width: 16, height: 16, borderRadius: 999, border: "none", background: "transparent", color: SUB,
     fontSize: 13, lineHeight: 1, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
   },
   semanaScroll: { overflowX: "auto", WebkitOverflowScrolling: "touch" },
@@ -2176,7 +2762,7 @@ const S = {
   semanaAxis: { width: 42, flexShrink: 0, position: "relative" },
   semanaHoraLabel: {
     position: "absolute", right: 6, transform: "translateY(-50%)",
-    fontSize: 9.5, color: SUB, fontWeight: 600, whiteSpace: "nowrap",
+    fontSize: 10, color: SUB, fontWeight: 600, whiteSpace: "nowrap",
   },
   semanaDiaHeader: {
     display: "flex", flexDirection: "column", alignItems: "center", gap: 2, padding: "4px 2px",
@@ -2192,30 +2778,40 @@ const S = {
   },
   semanaDiaHeaderNombre: { fontSize: 10, fontWeight: 700, color: SUB, textTransform: "uppercase" },
   semanaDiaHeaderNum: { fontSize: 14, fontWeight: 800, color: INK, display: "flex", alignItems: "center", gap: 3 },
-  semanaDiaCol: { position: "relative", borderLeft: `1px solid ${LINE}`, cursor: "pointer" },
+  // La línea que separa un día del otro la pone la clase "diasGridLineas" (ver el CSS de abajo),
+  // así queda continua desde el encabezado del día hasta el final de la grilla, como en Calendar.
+  semanaDiaCol: { position: "relative", cursor: "pointer" },
   semanaDiaColCerrado: {
     background: `repeating-linear-gradient(135deg, ${SURFACE_2}, ${SURFACE_2} 6px, transparent 6px, transparent 12px)`,
   },
   semanaGridLine: { position: "absolute", left: 0, right: 0, borderTop: `1px solid ${LINE}`, pointerEvents: "none" },
-  semanaAhora: { position: "absolute", left: 0, right: 0, height: 2, background: "#E0524A", zIndex: 5, pointerEvents: "none" },
-  semanaAhoraDot: { position: "absolute", left: -3, top: -3, width: 8, height: 8, borderRadius: 99, background: "#E0524A" },
+  semanaAhora: { position: "absolute", left: 0, right: 0, height: 2, background: "var(--ahora)", zIndex: 5, pointerEvents: "none" },
+  semanaAhoraDot: { position: "absolute", left: -3, top: -3, width: 8, height: 8, borderRadius: 999, background: "var(--ahora)" },
+  semanaVacacionesBanda: { position: "absolute", top: 2, left: 2, right: 2, display: "flex", gap: 3, zIndex: 4, pointerEvents: "none" },
+  semanaVacacionesDot: { width: 7, height: 7, borderRadius: 999, flexShrink: 0, display: "inline-block", boxShadow: "0 0 0 1.5px var(--vacaciones)" },
+  semanaFrancoBanda: { position: "absolute", top: 2, left: 2, right: 2, display: "flex", gap: 3, zIndex: 4, pointerEvents: "none" },
+  semanaFrancoDot: { width: 7, height: 7, borderRadius: 999, flexShrink: 0, display: "inline-block", boxShadow: "0 0 0 1.5px var(--sub)" },
   semanaEvento: {
-    position: "absolute", borderRadius: 6, padding: "3px 6px", color: "#fff", border: "none",
+    position: "absolute", borderRadius: 8, padding: "3px 6px", color: "#fff", border: "none",
     cursor: "pointer", overflow: "hidden", textAlign: "left", display: "flex", flexDirection: "column",
     boxSizing: "border-box",
   },
   semanaEventoNombre: { fontSize: 12, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
-  semanaEventoHora: { fontSize: 10.5, fontWeight: 600, opacity: 0.9 },
+  semanaEventoHora: { fontSize: 11, fontWeight: 600, opacity: 0.9 },
 };
 
 const CSS = `
   @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700;800&display=swap');
 
   .vdhApp {
+    color-scheme: light;
     --accent: #2C6E71;
     --accent-soft: #E3EFEE;
     --ink: #232823;
-    --sub: #8C9089;
+    /* #8C9089 (el gris viejo) daba 3.2:1 sobre blanco, por debajo del mínimo de 4.5:1 para
+       texto normal (WCAG AA) — este gris da ~5:1 y se lee bien sin perder la jerarquía sutil
+       que tiene que tener un texto "secundario". */
+    --sub: #6B7169;
     --bg: #EDF1F0;
     --card: #FFFFFF;
     --line: #E7E4DA;
@@ -2228,8 +2824,12 @@ const CSS = `
     --surface-input: #FAFAFB;
     --feriado: #8B6FB0;
     --multicopia: #4A5FD9;
+    --linea-dia: #C9C5B8;
+    --ahora: #E0524A;
+    --vacaciones: #3F8F5F;
   }
   .vdhApp[data-theme="dark"] {
+    color-scheme: dark;
     --accent: #4FA6A6;
     --accent-soft: #1E3536;
     --ink: #E7EBE8;
@@ -2246,6 +2846,9 @@ const CSS = `
     --surface-input: #1B2224;
     --feriado: #C7A6E8;
     --multicopia: #8B9BFF;
+    --linea-dia: #414A4D;
+    --ahora: #E37066;
+    --vacaciones: #6FBF8B;
   }
 
   * { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
@@ -2255,9 +2858,76 @@ const CSS = `
   *::-webkit-scrollbar-thumb:hover { background: var(--sub); }
 
   input:focus, select:focus { outline: none; }
-  input[style*="border"]:focus, select[style*="border"]:focus { border-color: ${ACCENT} !important; }
-  button { -webkit-tap-highlight-color: transparent; }
+  input[style*="border"]:focus, select[style*="border"]:focus {
+    border-color: ${ACCENT} !important;
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+
+  /* Hover / press / foco de teclado para TODA la app: sin esto ningún botón, chip, día del
+     calendario o turno responde antes del clic, que es lo que más hace sentir a una interfaz
+     "sin terminar". Se resuelve con una sola regla general (funciona para cualquier color de
+     fondo, sea el que sea) en vez de tener que declarar un :hover por cada estilo puntual. */
+  button, [role="button"], .diaClickeable {
+    -webkit-tap-highlight-color: transparent;
+    transition: filter 0.12s ease, box-shadow 0.12s ease, transform 0.06s ease, opacity 0.12s ease, background-color 0.12s ease;
+  }
+  button:disabled { cursor: default; }
+  @media (hover: hover) {
+    button:not(:disabled):hover, [role="button"]:not([aria-disabled="true"]):hover { filter: brightness(0.96); }
+    .vdhApp[data-theme="dark"] button:not(:disabled):hover,
+    .vdhApp[data-theme="dark"] [role="button"]:not([aria-disabled="true"]):hover { filter: brightness(1.18); }
+  }
+  button:not(:disabled):active, [role="button"]:not([aria-disabled="true"]):active { transform: scale(0.97); }
+
+  /* Anillo de foco visible solo para navegación por teclado (Tab), no al hacer clic con mouse —
+     los inputs/selects ya tienen su propio resalte de borde+sombra de arriba. */
+  button:focus-visible, [role="button"]:focus-visible, a:focus-visible, summary:focus-visible {
+    outline: 2px solid ${ACCENT};
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+  input:focus-visible, select:focus-visible {
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+
   @keyframes pulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.6); opacity: 0.5; } }
+  @keyframes fadeSlideIn { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes rowFadeIn { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes toastIn { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
+  .dotPulso {
+    width: 6px; height: 6px; border-radius: 999px; background: ${GOOD}; flex-shrink: 0;
+    animation: pulse 1s infinite ease-in-out;
+  }
+
+  /* Toast único (el más reciente reemplaza al anterior) para todo aviso de "hice esto, lo podés
+     deshacer": copiar/pegar días, borrar un vendedor o un local, reiniciar el mes. Antes cada
+     acción avisaba a su manera y en su propio lugar de la pantalla (texto suelto debajo de un
+     botón, con su propio setTimeout) — juntarlo achica el código y hace que la persona sepa
+     siempre dónde mirar.  */
+  .toast {
+    position: fixed; left: 50%; bottom: 22px; z-index: 40;
+    display: flex; align-items: center; gap: 10px;
+    background: var(--ink); color: var(--card); font-size: 12.5px; font-weight: 600;
+    border-radius: 999px; padding: 10px 10px 10px 16px; box-shadow: 0 10px 30px -8px rgba(0,0,0,0.35);
+    animation: toastIn 0.18s ease; max-width: calc(100vw - 32px);
+  }
+  .vdhApp[data-theme="dark"] .toast { background: #F2F4F1; color: #1B2224; }
+  .toast button { flex-shrink: 0; }
+  .toast .toastDeshacer { color: #7DD4CE; }
+  .vdhApp[data-theme="dark"] .toast .toastDeshacer { color: #2C6E71; }
+
+  /* El acordeón "Configuración del local" y los avisos del panel de horario (feriado, cerrado,
+     hueco sin cubrir) aparecían de golpe; con esto entran con una transición corta, no saltan
+     el layout de un frame a otro. */
+  .acordeonContenido, .avisoDia, .mensajeCopiado { animation: fadeSlideIn 0.15s ease; }
+  .rankFila { animation: rowFadeIn 0.2s ease; }
+
+  /* Corte entre un día y el siguiente, como en Google Calendar: cada día ARRANCA con una línea
+     de borde y TERMINA con aire libre. Junto con el gap más ancho de la grilla, ese canal queda
+     bastante más marcado que la separación entre dos turnos solapados del mismo día (3px), que
+     era lo que hacía difícil distinguir dónde terminaba un día y empezaba el otro. */
+  .diasGridLineas > * + * { border-left: 1px solid var(--linea-dia); }
 
   .appGrid { display: flex; flex-direction: column; gap: 12px; }
   .card-izquierda, .card-derecha { display: flex; flex-direction: column; gap: 12px; }
@@ -2273,6 +2943,12 @@ const CSS = `
     .card-izquierda { grid-area: izquierda; position: sticky; top: 20px; }
     .card-calendario { grid-area: calendario; }
     .card-derecha { grid-area: derecha; position: sticky; top: 20px; }
+
+    /* Con los paneles plegados queda una sola columna y el calendario ocupa todo el ancho. */
+    .appGrid.sin-paneles {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-areas: "calendario";
+    }
   }
 
   /* Imprimir / guardar como PDF: se aísla la tarjeta del calendario (nombre del local, fecha y
@@ -2294,5 +2970,18 @@ const CSS = `
     .solo-imprimir { display: block !important; margin-bottom: 10px; }
     .semanaScrollImprimible { max-height: none !important; overflow: visible !important; }
     .semanaScrollImprimible > div { min-width: 0 !important; }
+    /* El encabezado de días "flota" (sticky) al scrollear en pantalla; en una hoja impresa de
+       varias páginas eso puede duplicarse o cortarse raro, así que se lo deja fijo en su lugar. */
+    .semanaHeaderSticky { position: static !important; }
   }
+
+  /* "Compartir imagen": misma limpieza que Imprimir (ocultar botones, mostrar el encabezado con
+     local/fecha, ver el horario completo sin el recorte de alto) pero aplicada un instante antes
+     de sacarle la foto con html2canvas, en vez de vía @media print. */
+  .card-calendario.capturando-imagen .no-imprimir { display: none !important; }
+  .card-calendario.capturando-imagen .solo-imprimir { display: block !important; margin-bottom: 10px; }
+  .card-calendario.capturando-imagen .semanaScrollImprimible { max-height: none !important; overflow: visible !important; }
+  .card-calendario.capturando-imagen .semanaScrollImprimible > div { min-width: 0 !important; }
+  /* html2canvas no siempre respeta bien "position: sticky"; se lo deja fijo en su lugar. */
+  .card-calendario.capturando-imagen .semanaHeaderSticky { position: static !important; }
 `;
