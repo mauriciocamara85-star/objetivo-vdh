@@ -1,4 +1,4 @@
-# Objetivo VDH
+# Planificador VDH
 
 Reparte el objetivo de venta mensual entre los vendedores de cada local de VDH, según las horas reales que trabajó cada uno (calendario de horarios por turnos, no según cuánto abre el local).
 

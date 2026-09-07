@@ -1264,7 +1264,7 @@ export default function App() {
           </button>
           <div style={S.logoMark}>VDH</div>
           <div>
-            <div style={S.brandTitle}>Objetivo VDH</div>
+            <div style={S.brandTitle}>Planificador VDH</div>
             <div style={S.brandSubtitle}>REPARTO POR VENDEDOR</div>
           </div>
         </div>
