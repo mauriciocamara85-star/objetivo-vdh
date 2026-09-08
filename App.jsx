@@ -769,10 +769,51 @@ export default function App() {
   const updateVendedor = (vid, patch) =>
     updateLocal({ vendedores: local.vendedores.map((v) => (v.id === vid ? { ...v, ...patch } : v)) });
 
+  // Al marcar un día de la semana como cerrado fijo, se borra el horario que ya tuviera
+  // cargado cualquier vendedor ese día de la semana de HOY en adelante (no se toca el pasado,
+  // para no alterar horas ya usadas en el reparto de meses cerrados). Igual que con vacaciones
+  // y franco, esto NO bloquea cargar un horario después si hace falta (ej. reposición) — solo
+  // limpia lo que ya estaba cargado en el momento de cerrar el día.
   const toggleDiaCerrado = (wd) => {
     const actuales = local.diasCerrados || [];
-    const nuevos = actuales.includes(wd) ? actuales.filter((x) => x !== wd) : [...actuales, wd];
-    updateLocal({ diasCerrados: nuevos });
+    const activando = !actuales.includes(wd);
+    const nuevos = activando ? [...actuales, wd] : actuales.filter((x) => x !== wd);
+    let vendedores = local.vendedores;
+    let turnosBorrados = 0;
+    if (activando) {
+      const hoy = hoyComoFecha();
+      const hoyKey = dateKey(hoy.year, hoy.month, hoy.day);
+      // Primero se cuenta sin tocar nada, para poder avisar y dejar cancelar antes de borrar
+      // horario real ya cargado por algún supervisor.
+      let totalAfectado = 0;
+      local.vendedores.forEach((v) => {
+        Object.keys(v.dias).forEach((k) => {
+          if (k < hoyKey) return;
+          const { year, month, day } = fechaDeKey(k);
+          if (new Date(year, month - 1, day).getDay() === wd) totalAfectado++;
+        });
+      });
+      if (totalAfectado > 0) {
+        const ok = window.confirm(
+          `Cerrar los ${DIAS_SEMANA_LARGO[wd]} va a borrar ${totalAfectado} turno(s) ya cargados ese día de la semana (de hoy en adelante). ¿Confirmás?`
+        );
+        if (!ok) return;
+      }
+      vendedores = local.vendedores.map((v) => {
+        const dias = { ...v.dias };
+        let cambiado = false;
+        Object.keys(dias).forEach((k) => {
+          if (k < hoyKey) return;
+          const { year, month, day } = fechaDeKey(k);
+          if (new Date(year, month - 1, day).getDay() === wd) { delete dias[k]; turnosBorrados++; cambiado = true; }
+        });
+        return cambiado ? { ...v, dias } : v;
+      });
+    }
+    updateLocal({ diasCerrados: nuevos, vendedores });
+    if (activando && turnosBorrados > 0) {
+      mostrarToast(`Se cerró los ${DIAS_SEMANA_LARGO[wd]}: se borraron ${turnosBorrados} turno(s) futuro(s) ese día`, { deshacible: true });
+    }
   };
 
   // Franco fijo semanal de un vendedor. Al activarlo se borran los turnos que ya tuviera
@@ -790,6 +831,19 @@ export default function App() {
     if (activando) {
       const hoy = hoyComoFecha();
       const hoyKey = dateKey(hoy.year, hoy.month, hoy.day);
+      // Se cuenta antes de tocar nada, para poder avisar y dejar cancelar.
+      let totalAfectado = 0;
+      Object.keys(v.dias).forEach((k) => {
+        if (k < hoyKey) return;
+        const { year, month, day } = fechaDeKey(k);
+        if (new Date(year, month - 1, day).getDay() === wd) totalAfectado++;
+      });
+      if (totalAfectado > 0) {
+        const ok = window.confirm(
+          `Poner franco fijo los ${DIAS_SEMANA_LARGO[wd]} a ${v.nombre || "este vendedor"} va a borrar ${totalAfectado} turno(s) ya cargados ese día (de hoy en adelante). ¿Confirmás?`
+        );
+        if (!ok) return;
+      }
       dias = { ...v.dias };
       Object.keys(dias).forEach((k) => {
         if (k < hoyKey) return;
@@ -808,11 +862,36 @@ export default function App() {
       mostrarToast(`Se sacó el franco fijo de los ${DIAS_SEMANA_LARGO[wd]}`, { deshacible: true });
     }
   };
+  // Al agregar un feriado/fecha puntual cerrada, se borra el horario que ya tuviera cargado
+  // cualquier vendedor ESE día puntual (si la fecha ya pasó, no se toca — mismo criterio que
+  // vacaciones/franco/días cerrados fijos). No bloquea cargar horario después (ej. reposición).
   const agregarFechaCerrada = (iso) => {
     if (!iso) return;
     const actuales = local.fechasCerradas || [];
     if (actuales.includes(iso)) return;
-    updateLocal({ fechasCerradas: [...actuales, iso].sort() });
+    const hoy = hoyComoFecha();
+    const hoyKey = dateKey(hoy.year, hoy.month, hoy.day);
+    const afectados = iso < hoyKey ? [] : local.vendedores.filter((v) => v.dias[iso]);
+    if (afectados.length > 0) {
+      const nombres = afectados.map((v) => v.nombre || "Sin nombre").join(", ");
+      const ok = window.confirm(
+        `${fmtFechaCorta(iso)} ya tiene horario cargado para: ${nombres}. Si marcás el feriado se va a borrar. ¿Confirmás?`
+      );
+      if (!ok) return;
+    }
+    const vendedores = local.vendedores.map((v) => {
+      if (!afectados.some((a) => a.id === v.id)) return v;
+      const dias = { ...v.dias };
+      delete dias[iso];
+      return { ...v, dias };
+    });
+    updateLocal({ fechasCerradas: [...actuales, iso].sort(), vendedores });
+    if (afectados.length > 0) {
+      mostrarToast(
+        `Feriado agregado: ${fmtFechaCorta(iso)} · se borró el horario de ${afectados.length} vendedor(es) ese día`,
+        { deshacible: true }
+      );
+    }
   };
   const quitarFechaCerrada = (iso) => {
     updateLocal({ fechasCerradas: (local.fechasCerradas || []).filter((f) => f !== iso) });
@@ -839,7 +918,15 @@ export default function App() {
       return;
     }
     // De vacaciones no se puede tener horario cargado: se borra cualquier turno ya cargado de
-    // ese vendedor dentro del rango, sea del mes que sea (no solo el que se está viendo).
+    // ese vendedor dentro del rango, sea del mes que sea (no solo el que se está viendo). Se
+    // cuenta antes de tocar nada, para poder avisar y dejar cancelar.
+    const totalAfectado = Object.keys(v.dias).filter((k) => k >= inicioISO && k <= finISO).length;
+    if (totalAfectado > 0) {
+      const ok = window.confirm(
+        `${v.nombre || "Ese vendedor"} ya tiene horario cargado en ${totalAfectado} día(s) dentro de ese rango. Si cargás las vacaciones se van a borrar. ¿Confirmás?`
+      );
+      if (!ok) return;
+    }
     const dias = { ...v.dias };
     let turnosBorrados = 0;
     Object.keys(dias).forEach((k) => {
@@ -2059,6 +2146,10 @@ function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFech
               else if (hoy) estilo = S.semanaDiaHeaderHoy;
               const marcadoParaCopiar = diasParaCopiar && diasParaCopiar.has(key);
               if (marcadoParaCopiar) estilo = { ...estilo, ...S.diaMarcadoParaCopiar };
+              // Seleccionado: relleno sólido y texto blanco (mismo lenguaje que los botones
+              // Mes/Semana/Día activos). Hoy sin seleccionar: solo el color de acento. El resto,
+              // el color por defecto de cada span.
+              const colorTexto = sel ? "#fff" : hoy ? ACCENT : undefined;
               return (
                 <button
                   key={i}
@@ -2069,8 +2160,10 @@ function GrillaSemana({ dias, vendedores, local, fechaSeleccionada, onSelectFech
                   style={estilo}
                   title={feriado || undefined}
                 >
-                  <span style={S.semanaDiaHeaderNombre}>{DIAS_SEMANA_LARGO[fecha.getDay()].slice(0, 3)}</span>
-                  <span style={S.semanaDiaHeaderNum}>
+                  <span style={colorTexto ? { ...S.semanaDiaHeaderNombre, color: colorTexto } : S.semanaDiaHeaderNombre}>
+                    {DIAS_SEMANA_LARGO[fecha.getDay()].slice(0, 3)}
+                  </span>
+                  <span style={colorTexto ? { ...S.semanaDiaHeaderNum, color: colorTexto } : S.semanaDiaHeaderNum}>
                     {d}{feriado && <span style={S.feriadoDot} />}{marcadoParaCopiar && <span style={S.multicopiaCheck}>✓</span>}
                   </span>
                 </button>
@@ -2766,15 +2859,18 @@ const S = {
   },
   semanaDiaHeader: {
     display: "flex", flexDirection: "column", alignItems: "center", gap: 2, padding: "4px 2px",
-    borderRadius: 8, border: "none", background: "transparent", cursor: "pointer",
+    borderRadius: 8, border: `1px solid ${ACCENT}`, background: CARD, cursor: "pointer",
   },
   semanaDiaHeaderHoy: {
     display: "flex", flexDirection: "column", alignItems: "center", gap: 2, padding: "4px 2px",
-    borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: ACCENT,
+    borderRadius: 8, border: `1px solid ${ACCENT}`, background: CARD, cursor: "pointer",
   },
+  // Seleccionado: mismo lenguaje que los botones activos Mes/Semana/Día (ver vistaBtnActive) —
+  // relleno sólido de acento en vez de solo un borde, para que se note claramente cuál es el
+  // día elegido ahora que TODOS los días tienen su propio recuadro.
   semanaDiaHeaderSel: {
     display: "flex", flexDirection: "column", alignItems: "center", gap: 2, padding: "4px 2px",
-    borderRadius: 8, border: `1px solid ${ACCENT}`, background: ACCENT_SOFT, cursor: "pointer",
+    borderRadius: 8, border: `1px solid ${ACCENT}`, background: ACCENT, cursor: "pointer",
   },
   semanaDiaHeaderNombre: { fontSize: 10, fontWeight: 700, color: SUB, textTransform: "uppercase" },
   semanaDiaHeaderNum: { fontSize: 14, fontWeight: 800, color: INK, display: "flex", alignItems: "center", gap: 3 },
