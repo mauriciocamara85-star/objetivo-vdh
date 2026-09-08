@@ -90,6 +90,11 @@ const Printer = (p) => <Icon {...p}>
   <path d="M6 9V2h12v7" /><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" />
   <rect x="6" y="14" width="12" height="8" />
 </Icon>;
+const Settings = (p) => <Icon {...p}>
+  <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+  <circle cx="12" cy="12" r="3" />
+</Icon>;
+const X = (p) => <Icon {...p}><path d="M18 6L6 18M6 6l12 12" /></Icon>;
 
 const STORAGE_KEY = "vdh-objetivo-calendario"; // fallback localStorage (sin Firebase configurado)
 const UI_PREFS_KEY = "vdh-objetivo-ui-prefs"; // preferencias locales de navegación (no se comparten)
@@ -600,11 +605,14 @@ function App() {
   const [vendedorActivo, setVendedorActivo] = useState(null);
   const [fechaSeleccionada, setFechaSeleccionada] = useState(null); // { year, month, day } | null
   const [localOpen, setLocalOpen] = useState(false);
-  const [configAbierta, setConfigAbierta] = useState(false); // acordeón de "Configuración del local"
-  // Paneles laterales plegables (como el menú ☰ de Google Calendar): con un solo botón se van los
-  // dos y el calendario pasa a ocupar todo el ancho de la pantalla, que es cuando mejor se lee y
-  // mejor sale la foto para mandar al grupo.
-  const [panelesAbiertos, setPanelesAbiertos] = useState(true);
+  // "Configuración del local" (horario del local, días cerrados, feriados, vacaciones, francos,
+  // objetivo del mes y aspecto): vive en un overlay que abre el ⚙ del header, como el engranaje de
+  // Google Calendar. Antes era un acordeón dentro del panel izquierdo, y aunque esté plegado le
+  // ocupaba lugar todos los días a lo que sí se usa seguido (vendedores + horario del día).
+  const [configAbierta, setConfigAbierta] = useState(false);
+  // Panel izquierdo (vendedores + horario del día) plegable con el ☰, como el menú de Google
+  // Calendar: al plegarlo el calendario se estira y se lee mejor (y sale mejor la foto para el grupo).
+  const [panelIzquierdoAbierto, setPanelIzquierdoAbierto] = useState(true);
   // Portapapeles de "copiar día": todos los turnos de todos los vendedores de un día puntual,
   // para pegarlos en otro. Vive solo en esta pestaña, no se persiste.
   const [diaCopiado, setDiaCopiado] = useState(null); // { localId, dias: [{offsetDias, porVendedor}] } | null
@@ -633,6 +641,13 @@ function App() {
     document.addEventListener("mousedown", onClickFuera);
     return () => document.removeEventListener("mousedown", onClickFuera);
   }, [compartirAbierto]);
+  // Escape cierra el overlay de configuración, como cualquier modal.
+  useEffect(() => {
+    if (!configAbierta) return;
+    const onKey = (e) => { if (e.key === "Escape") setConfigAbierta(false); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [configAbierta]);
   const toggleDiaParaCopiar = (fecha) => {
     const key = dateKey(fecha.year, fecha.month, fecha.day);
     setDiasParaCopiar((prev) => {
@@ -1415,16 +1430,17 @@ function App() {
   };
 
   return (
-    <div className="vdhApp" data-theme={tema} style={panelesAbiertos ? S.page : { ...S.page, maxWidth: "none" }}>
+    <div className="vdhApp" data-theme={tema} style={panelIzquierdoAbierto ? S.page : { ...S.page, maxWidth: "none" }}>
       <style>{CSS}</style>
 
       {/* Header: compacto, todo en una fila, para dejarle más lugar al calendario */}
       <div style={S.headerBand}>
         <div style={S.logoRow}>
           <button
-            onClick={() => setPanelesAbiertos((a) => !a)}
+            onClick={() => setPanelIzquierdoAbierto((a) => !a)}
             style={S.panelToggleBtn}
-            title={panelesAbiertos ? "Ocultar los paneles laterales y agrandar el calendario" : "Volver a mostrar los paneles laterales"}
+            title={panelIzquierdoAbierto ? "Ocultar el panel de vendedores y horario, y agrandar el calendario" : "Volver a mostrar el panel de vendedores y horario"}
+            aria-expanded={panelIzquierdoAbierto}
           >
             ☰
           </button>
@@ -1476,12 +1492,16 @@ function App() {
             >
               ↩ Deshacer
             </button>
+            {/* El engranaje abre TODO lo que se configura una vez y queda (horario del local,
+                días cerrados, feriados, vacaciones, francos, objetivo del mes y el modo claro/
+                oscuro), como en Google Calendar. */}
             <button
-              onClick={() => setTema((t) => (t === "dark" ? "light" : "dark"))}
-              style={S.temaBtn}
-              title={tema === "dark" ? "Cambiar a modo claro" : "Cambiar a modo oscuro"}
+              onClick={() => setConfigAbierta(true)}
+              style={S.configBtn}
+              title="Configuración del local"
+              aria-haspopup="dialog"
             >
-              {tema === "dark" ? "☀️" : "🌙"}
+              <Settings size={15} />
             </button>
           </div>
           {estadoGuardado === "error" ? (
@@ -1511,156 +1531,14 @@ function App() {
         onPrev={navPrev} onNext={navNext} onHoy={irAHoy}
       />
 
-      <div className={`appGrid${panelesAbiertos ? "" : " sin-paneles"}`}>
-        {/* Columna izquierda: configuración y edición. Se saca del DOM (no se esconde) al plegar,
-            si no la grilla le sigue reservando su columna y el calendario no se estira. */}
-        {panelesAbiertos && (
+      <div className={`appGrid${panelIzquierdoAbierto ? "" : " sin-panel-izq"}`}>
+        {/* Columna izquierda: elegir el vendedor y cargarle el horario del día son los dos pasos
+            del mismo gesto, así que van pegados, uno abajo del otro (antes el horario estaba en la
+            columna de la derecha y había que cruzar el calendario entero en cada carga). Se saca
+            del DOM (no se esconde) al plegar con el ☰, si no la grilla le sigue reservando su
+            columna y el calendario no se estira. */}
+        {panelIzquierdoAbierto && (
         <div className="card-izquierda">
-          <div style={S.card}>
-            <div style={S.rowBetween}>
-              <input
-                value={local.nombre}
-                onChange={(e) => updateLocal({ nombre: e.target.value })}
-                style={S.nameInput}
-                placeholder="Nombre del local"
-              />
-              {sharedData.locales.length > 1 && (
-                <button onClick={() => removeLocal(local.id)} style={S.iconGhost}>
-                  <Trash2 size={14} />
-                </button>
-              )}
-            </div>
-            <label style={S.field}>
-              <span style={S.label}>Objetivo del mes</span>
-              <MoneyInput
-                value={local.objetivoTotal}
-                onChange={(n) => updateLocal({ objetivoTotal: n })}
-                style={S.input}
-                placeholder="Opcional"
-              />
-            </label>
-
-            {/* Cosas que se configuran una vez y casi no se tocan: quedan plegadas para no
-                ocuparle lugar todos los días a lo que sí se usa seguido (vendedores, calendario). */}
-            <button
-              onClick={() => setConfigAbierta((o) => !o)}
-              style={S.configToggleBtn}
-              aria-expanded={configAbierta}
-            >
-              <span>Configuración del local</span>
-              <ChevronDown
-                size={15}
-                style={{ transform: configAbierta ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}
-              />
-            </button>
-
-            {configAbierta && (
-              <div className="acordeonContenido">
-                <div style={{ ...S.twoCol, marginTop: 10 }}>
-                  <label style={S.field}>
-                    <span style={S.label}>Local abre desde</span>
-                    <select
-                      value={local.horaInicio}
-                      onChange={(e) => updateLocal({ horaInicio: e.target.value })}
-                      style={S.input}
-                    >
-                      {generarOpcionesHora("00:00", "23:30").map((h) => (
-                        <option key={h} value={h}>{h}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label style={S.field}>
-                    <span style={S.label}>Hasta</span>
-                    <select
-                      value={local.horaFin}
-                      onChange={(e) => updateLocal({ horaFin: e.target.value })}
-                      style={S.input}
-                    >
-                      {generarOpcionesHora("00:00", "23:30").map((h) => (
-                        <option key={h} value={h}>{h}</option>
-                      ))}
-                    </select>
-                  </label>
-                </div>
-
-                <div style={S.cerradosBlock}>
-                  <span style={S.label}>Días cerrados fijos</span>
-                  <div style={S.cerradosChipRow}>
-                    {DIAS_SEMANA.map((w, i) => {
-                      const wd = JS_WEEKDAY_DE_INDICE[i];
-                      const activo = (local.diasCerrados || []).includes(wd);
-                      return (
-                        <button
-                          key={i}
-                          onClick={() => toggleDiaCerrado(wd)}
-                          style={activo ? S.cerradoChipActivo : S.cerradoChip}
-                        >{w}</button>
-                      );
-                    })}
-                  </div>
-
-                  <span style={{ ...S.label, marginTop: 10, display: "block" }}>Horarios especiales (ej. domingos de 10 a 21)</span>
-                  {Object.keys(local.horariosEspeciales || {}).length > 0 && (
-                    <div style={S.feriadoList}>
-                      {Object.entries(local.horariosEspeciales).sort(([a], [b]) => a - b).map(([wd, h]) => (
-                        <span key={wd} style={S.feriadoChip}>
-                          {DIAS_SEMANA_LARGO[wd]} {h.inicio}–{h.fin}
-                          <button onClick={() => quitarHorarioEspecial(wd)} style={S.feriadoRemove}>×</button>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                  <HorarioEspecialPicker local={local} onAgregar={agregarHorarioEspecial} />
-
-                  <span style={{ ...S.label, marginTop: 10, display: "block" }}>Feriados / fechas puntuales cerradas</span>
-                  <FeriadoPicker onAgregar={agregarFechaCerrada} />
-                  {(local.fechasCerradas || []).length > 0 && (
-                    <div style={S.feriadoList}>
-                      {[...(local.fechasCerradas || [])].sort().map((f) => (
-                        <span key={f} style={S.feriadoChip}>
-                          {fmtFechaCorta(f)}
-                          <button onClick={() => quitarFechaCerrada(f)} style={S.feriadoRemove}>×</button>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                <div style={S.cerradosBlock}>
-                  <span style={S.label}>Vacaciones de vendedores</span>
-                  <VacacionesPicker local={local} onAgregar={agregarVacacion} />
-                  {todasVacaciones.length > 0 && (
-                    <div style={S.feriadoList}>
-                      {todasVacaciones.map((r) => (
-                        <span key={r.id} style={S.feriadoChip}>
-                          <span style={{ ...S.chipDot, background: r.vendedorColor }} />
-                          {r.vendedorNombre || "Sin nombre"}: {fmtFechaCorta(r.inicio)}–{fmtFechaCorta(r.fin)}
-                          <button onClick={() => quitarVacacion(r.vendedorId, r.id)} style={S.feriadoRemove}>×</button>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                <div style={S.cerradosBlock}>
-                  <span style={S.label}>Franco fijo de vendedores</span>
-                  <FrancoPicker local={local} onToggle={toggleFrancoVendedor} />
-                  {todosFrancos.length > 0 && (
-                    <div style={S.feriadoList}>
-                      {todosFrancos.map((f) => (
-                        <span key={f.id} style={S.feriadoChip}>
-                          <span style={{ ...S.chipDot, background: f.vendedorColor }} />
-                          {f.vendedorNombre || "Sin nombre"}: {DIAS_SEMANA_LARGO[f.wd]}
-                          <button onClick={() => toggleFrancoVendedor(f.vendedorId, f.wd)} style={S.feriadoRemove}>×</button>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-
           <div style={S.card}>
             <div style={S.rowBetween}>
               <div style={S.sectionTitle}>Vendedores</div>
@@ -1697,6 +1575,31 @@ function App() {
               />
             )}
           </div>
+
+          <TurnoEditorCard
+            vendedor={vActivo}
+            vendedores={local.vendedores}
+            local={local}
+            fecha={fechaSeleccionada}
+            onCambiarFecha={setFechaSeleccionada}
+            onSetTurnos={(turnos) => setTurnosDia(vActivo, fechaSeleccionada, turnos)}
+            onQuitarDia={() => quitarDiaVendedor(vActivo, fechaSeleccionada)}
+            copiaDisponible={
+              diaCopiado && diaCopiado.localId === local.id
+                ? { cantidadDias: diaCopiado.dias.length }
+                : null
+            }
+            diasSeleccionadosParaCopiar={diasParaCopiar.size}
+            onCopiarDia={() => {
+              const fechas = diasParaCopiar.size > 0
+                ? [...diasParaCopiar].map(fechaDeKey)
+                : (fechaSeleccionada ? [fechaSeleccionada] : []);
+              copiarDias(fechas);
+              setDiasParaCopiar(new Set());
+            }}
+            onLimpiarSeleccion={() => setDiasParaCopiar(new Set())}
+            onPegarDia={() => pegarDias(fechaSeleccionada)}
+          />
         </div>
         )}
 
@@ -1811,34 +1714,9 @@ function App() {
           </div>
         </div>
 
-        {/* Columna derecha: horario del día seleccionado + reparto del mes (se pliega con el ☰) */}
-        {panelesAbiertos && (
+        {/* Columna derecha: el reparto del mes, que se mira de refilón mientras se carga (no se
+            edita), por eso queda del otro lado y no compite con la columna de trabajo. */}
         <div className="card-derecha">
-          <TurnoEditorCard
-            vendedor={vActivo}
-            vendedores={local.vendedores}
-            local={local}
-            fecha={fechaSeleccionada}
-            onCambiarFecha={setFechaSeleccionada}
-            onSetTurnos={(turnos) => setTurnosDia(vActivo, fechaSeleccionada, turnos)}
-            onQuitarDia={() => quitarDiaVendedor(vActivo, fechaSeleccionada)}
-            copiaDisponible={
-              diaCopiado && diaCopiado.localId === local.id
-                ? { cantidadDias: diaCopiado.dias.length }
-                : null
-            }
-            diasSeleccionadosParaCopiar={diasParaCopiar.size}
-            onCopiarDia={() => {
-              const fechas = diasParaCopiar.size > 0
-                ? [...diasParaCopiar].map(fechaDeKey)
-                : (fechaSeleccionada ? [fechaSeleccionada] : []);
-              copiarDias(fechas);
-              setDiasParaCopiar(new Set());
-            }}
-            onLimpiarSeleccion={() => setDiasParaCopiar(new Set())}
-            onPegarDia={() => pegarDias(fechaSeleccionada)}
-          />
-
           <div style={S.card}>
             <div style={S.rowBetween}>
               <div>
@@ -1882,8 +1760,181 @@ function App() {
             )}
           </div>
         </div>
-        )}
       </div>
+
+      {/* Configuración del local (⚙ del header): todo lo que se configura una vez y queda —
+          nombre y objetivo del local, horario de apertura, días cerrados, feriados, vacaciones,
+          franco fijo y el modo claro/oscuro. Va como overlay y afuera de la grilla a propósito:
+          cerrado no ocupa NADA de la pantalla de todos los días, que es para cargar horarios. */}
+      {configAbierta && (
+        <div
+          className="modalFondo no-imprimir"
+          onMouseDown={(e) => { if (e.target === e.currentTarget) setConfigAbierta(false); }}
+        >
+          <div className="modalPanel" role="dialog" aria-modal="true" aria-label="Configuración del local">
+            <div style={S.modalHeaderRow}>
+              <div style={S.modalHeaderTitulo}>
+                <div style={S.eyebrowLine}>// CONFIGURACIÓN DEL LOCAL</div>
+                <input
+                  value={local.nombre}
+                  onChange={(e) => updateLocal({ nombre: e.target.value })}
+                  style={S.nameInput}
+                  placeholder="Nombre del local"
+                />
+              </div>
+              <div style={S.modalHeaderBotones}>
+                {sharedData.locales.length > 1 && (
+                  <button
+                    onClick={() => { removeLocal(local.id); setConfigAbierta(false); }}
+                    style={S.iconGhost}
+                    title="Borrar este local"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                )}
+                <button
+                  onClick={() => setConfigAbierta(false)}
+                  style={S.modalCerrarBtn}
+                  title="Cerrar (Esc)"
+                  aria-label="Cerrar"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+            </div>
+
+            <div className="modalScroll" style={S.modalBody}>
+              <label style={S.field}>
+                <span style={S.label}>Objetivo del mes</span>
+                <MoneyInput
+                  value={local.objetivoTotal}
+                  onChange={(n) => updateLocal({ objetivoTotal: n })}
+                  style={S.input}
+                  placeholder="Opcional"
+                />
+              </label>
+
+              <div style={{ ...S.twoCol, marginTop: 12 }}>
+                <label style={S.field}>
+                  <span style={S.label}>Local abre desde</span>
+                  <select
+                    value={local.horaInicio}
+                    onChange={(e) => updateLocal({ horaInicio: e.target.value })}
+                    style={S.input}
+                  >
+                    {generarOpcionesHora("00:00", "23:30").map((h) => (
+                      <option key={h} value={h}>{h}</option>
+                    ))}
+                  </select>
+                </label>
+                <label style={S.field}>
+                  <span style={S.label}>Hasta</span>
+                  <select
+                    value={local.horaFin}
+                    onChange={(e) => updateLocal({ horaFin: e.target.value })}
+                    style={S.input}
+                  >
+                    {generarOpcionesHora("00:00", "23:30").map((h) => (
+                      <option key={h} value={h}>{h}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+
+              <div style={S.cerradosBlock}>
+                <span style={S.label}>Días cerrados fijos</span>
+                <div style={S.cerradosChipRow}>
+                  {DIAS_SEMANA.map((w, i) => {
+                    const wd = JS_WEEKDAY_DE_INDICE[i];
+                    const activo = (local.diasCerrados || []).includes(wd);
+                    return (
+                      <button
+                        key={i}
+                        onClick={() => toggleDiaCerrado(wd)}
+                        style={activo ? S.cerradoChipActivo : S.cerradoChip}
+                      >{w}</button>
+                    );
+                  })}
+                </div>
+
+                <span style={{ ...S.label, marginTop: 10, display: "block" }}>Horarios especiales (ej. domingos de 10 a 21)</span>
+                {Object.keys(local.horariosEspeciales || {}).length > 0 && (
+                  <div style={S.feriadoList}>
+                    {Object.entries(local.horariosEspeciales).sort(([a], [b]) => a - b).map(([wd, h]) => (
+                      <span key={wd} style={S.feriadoChip}>
+                        {DIAS_SEMANA_LARGO[wd]} {h.inicio}–{h.fin}
+                        <button onClick={() => quitarHorarioEspecial(wd)} style={S.feriadoRemove}>×</button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <HorarioEspecialPicker local={local} onAgregar={agregarHorarioEspecial} />
+
+                <span style={{ ...S.label, marginTop: 10, display: "block" }}>Feriados / fechas puntuales cerradas</span>
+                <FeriadoPicker onAgregar={agregarFechaCerrada} />
+                {(local.fechasCerradas || []).length > 0 && (
+                  <div style={S.feriadoList}>
+                    {[...(local.fechasCerradas || [])].sort().map((f) => (
+                      <span key={f} style={S.feriadoChip}>
+                        {fmtFechaCorta(f)}
+                        <button onClick={() => quitarFechaCerrada(f)} style={S.feriadoRemove}>×</button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div style={S.cerradosBlock}>
+                <span style={S.label}>Vacaciones de vendedores</span>
+                <VacacionesPicker local={local} onAgregar={agregarVacacion} />
+                {todasVacaciones.length > 0 && (
+                  <div style={S.feriadoList}>
+                    {todasVacaciones.map((r) => (
+                      <span key={r.id} style={S.feriadoChip}>
+                        <span style={{ ...S.chipDot, background: r.vendedorColor }} />
+                        {r.vendedorNombre || "Sin nombre"}: {fmtFechaCorta(r.inicio)}–{fmtFechaCorta(r.fin)}
+                        <button onClick={() => quitarVacacion(r.vendedorId, r.id)} style={S.feriadoRemove}>×</button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div style={S.cerradosBlock}>
+                <span style={S.label}>Franco fijo de vendedores</span>
+                <FrancoPicker local={local} onToggle={toggleFrancoVendedor} />
+                {todosFrancos.length > 0 && (
+                  <div style={S.feriadoList}>
+                    {todosFrancos.map((f) => (
+                      <span key={f.id} style={S.feriadoChip}>
+                        <span style={{ ...S.chipDot, background: f.vendedorColor }} />
+                        {f.vendedorNombre || "Sin nombre"}: {DIAS_SEMANA_LARGO[f.wd]}
+                        <button onClick={() => toggleFrancoVendedor(f.vendedorId, f.wd)} style={S.feriadoRemove}>×</button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Aspecto: el modo claro/oscuro vivía suelto en el header. Es una preferencia de
+                  cada dispositivo que se elige una vez, así que su lugar es acá adentro. */}
+              <div style={S.cerradosBlock}>
+                <span style={S.label}>Aspecto</span>
+                <div style={S.temaSwitchRow}>
+                  <button
+                    onClick={() => setTema("light")}
+                    style={tema === "light" ? S.vistaBtnActive : S.vistaBtn}
+                  >☀️ Claro</button>
+                  <button
+                    onClick={() => setTema("dark")}
+                    style={tema === "dark" ? S.vistaBtnActive : S.vistaBtn}
+                  >🌙 Oscuro</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {toast && (
         <div className="toast no-imprimir" role="status">
@@ -2668,10 +2719,22 @@ const S = {
     fontSize: 12, fontWeight: 700, color: SUB, background: "transparent", border: "none",
     borderRadius: 8, padding: "5px 9px", cursor: "default", opacity: 0.4, whiteSpace: "nowrap",
   },
-  temaBtn: {
-    width: 22, height: 22, borderRadius: 999, border: "none", background: "transparent",
-    fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
+  configBtn: {
+    width: 26, height: 26, borderRadius: 8, border: "none", background: SURFACE_2, color: INK,
+    cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 0, flexShrink: 0,
   },
+  modalHeaderRow: {
+    display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10,
+    padding: "13px 15px 11px", borderBottom: `1px solid ${LINE}`, flexShrink: 0,
+  },
+  modalHeaderTitulo: { display: "flex", flexDirection: "column", minWidth: 0, flex: 1 },
+  modalHeaderBotones: { display: "flex", alignItems: "center", gap: 6, flexShrink: 0 },
+  modalCerrarBtn: {
+    width: 28, height: 28, borderRadius: 8, border: "none", background: SURFACE_2, color: SUB,
+    display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0,
+  },
+  modalBody: { padding: "13px 15px 16px" },
+  temaSwitchRow: { display: "flex", gap: 6, marginTop: 6 },
   panelToggleBtn: {
     width: 26, height: 26, borderRadius: 8, border: "none", background: SURFACE_2, color: INK,
     fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
@@ -2904,12 +2967,6 @@ const S = {
   },
   miniStatStrong: { fontSize: 12, fontWeight: 800, color: INK },
   cerradosBlock: { marginTop: 12, paddingTop: 12, borderTop: `1px solid ${LINE}` },
-  configToggleBtn: {
-    width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
-    marginTop: 12, paddingTop: 12, paddingBottom: 2,
-    borderWidth: 0, borderTopWidth: 1, borderTopStyle: "solid", borderTopColor: LINE,
-    background: "transparent", cursor: "pointer", color: SUB, fontSize: 12, fontWeight: 700,
-  },
   cerradosChipRow: { display: "flex", gap: 5, marginTop: 6 },
   cerradoChip: {
     width: 30, height: 30, borderRadius: 8, border: `1px solid ${LINE}`, background: SURFACE_INPUT,
@@ -3081,7 +3138,9 @@ const CSS = `
      botón, con su propio setTimeout) — juntarlo achica el código y hace que la persona sepa
      siempre dónde mirar.  */
   .toast {
-    position: fixed; left: 50%; bottom: 22px; z-index: 40;
+    /* Por encima del overlay de configuración (z-index 50): varias acciones de ahí adentro
+       (cerrar un día, cargar vacaciones) avisan con toast y ofrecen deshacer. */
+    position: fixed; left: 50%; bottom: 22px; z-index: 60;
     display: flex; align-items: center; gap: 10px;
     background: var(--ink); color: var(--card); font-size: 12.5px; font-weight: 600;
     border-radius: 999px; padding: 10px 10px 10px 16px; box-shadow: 0 10px 30px -8px rgba(0,0,0,0.35);
@@ -3092,10 +3151,9 @@ const CSS = `
   .toast .toastDeshacer { color: #7DD4CE; }
   .vdhApp[data-theme="dark"] .toast .toastDeshacer { color: #2C6E71; }
 
-  /* El acordeón "Configuración del local" y los avisos del panel de horario (feriado, cerrado,
-     hueco sin cubrir) aparecían de golpe; con esto entran con una transición corta, no saltan
-     el layout de un frame a otro. */
-  .acordeonContenido, .avisoDia, .mensajeCopiado { animation: fadeSlideIn 0.15s ease; }
+  /* Los avisos del panel de horario (feriado, cerrado, hueco sin cubrir) aparecían de golpe; con
+     esto entran con una transición corta, no saltan el layout de un frame a otro. */
+  .avisoDia, .mensajeCopiado { animation: fadeSlideIn 0.15s ease; }
   .rankFila { animation: rowFadeIn 0.2s ease; }
 
   /* Línea divisoria entre un día y el siguiente (encabezado y grilla usan la misma clase, así
@@ -3108,7 +3166,10 @@ const CSS = `
   @media (min-width: 900px) {
     .appGrid {
       display: grid;
-      grid-template-columns: 280px minmax(0, 1fr) 300px;
+      /* La columna de trabajo (izquierda: vendedores + horario del día) es la más ancha de las
+         dos laterales porque tiene los selects de hora uno al lado del otro; la de la derecha
+         solo muestra el reparto, que entra cómodo en menos. */
+      grid-template-columns: 300px minmax(0, 1fr) 280px;
       grid-template-areas: "izquierda calendario derecha";
       gap: 16px;
       align-items: start;
@@ -3117,12 +3178,34 @@ const CSS = `
     .card-calendario { grid-area: calendario; }
     .card-derecha { grid-area: derecha; position: sticky; top: 20px; }
 
-    /* Con los paneles plegados queda una sola columna y el calendario ocupa todo el ancho. */
-    .appGrid.sin-paneles {
-      grid-template-columns: minmax(0, 1fr);
-      grid-template-areas: "calendario";
+    /* Con el panel izquierdo plegado (☰) quedan calendario + reparto, y el calendario se estira
+       para ocupar todo lo que quedó libre. */
+    .appGrid.sin-panel-izq {
+      grid-template-columns: minmax(0, 1fr) 280px;
+      grid-template-areas: "calendario derecha";
     }
   }
+
+  /* Overlay de "Configuración del local" (⚙ del header). Es un modal y no un panel fijo a
+     propósito: son ajustes que se tocan una vez y quedan, no tienen por qué ocupar lugar en la
+     pantalla de todos los días. */
+  .modalFondo {
+    position: fixed; inset: 0; z-index: 50;
+    display: flex; align-items: center; justify-content: center; padding: 20px;
+    background: rgba(15, 19, 21, 0.5);
+    animation: rowFadeIn 0.12s ease;
+  }
+  .modalPanel {
+    display: flex; flex-direction: column;
+    width: 100%; max-width: 460px; max-height: min(86vh, 780px);
+    background: var(--card); border-radius: 16px; overflow: hidden;
+    box-shadow: 0 24px 60px -12px rgba(0,0,0,0.45);
+    animation: modalIn 0.16s ease;
+  }
+  /* El que scrollea es el cuerpo, no el modal entero: el encabezado (nombre del local, cerrar)
+     queda siempre a la vista. */
+  .modalScroll { overflow-y: auto; min-height: 0; }
+  @keyframes modalIn { from { opacity: 0; transform: translateY(6px) scale(0.99); } to { opacity: 1; transform: none; } }
 
   /* Imprimir / guardar como PDF: se aísla la tarjeta del calendario (nombre del local, fecha y
      la grilla) y se oculta todo lo demás (header, navegador, paneles de configuración/reparto,
