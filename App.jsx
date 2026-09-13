@@ -547,6 +547,8 @@ export default function App() {
   // suprimir esos carteles ("no permitir más diálogos") y entonces la restauración no se hacía
   // y no avisaba nada — pasaba en silencio, que es lo peor que puede hacer un botón así.
   const [restauracion, setRestauracion] = useState(null);
+  // Confirmación en dos pasos para borrar un local (el botón se convierte en "¿Sí, borrar?").
+  const [borrarLocalPendiente, setBorrarLocalPendiente] = useState(false);
   // Panel izquierdo (vendedores + horario del día) plegable con el ☰, como el menú de Google
   // Calendar: al plegarlo el calendario se estira y se lee mejor (y sale mejor la foto para el grupo).
   const [panelIzquierdoAbierto, setPanelIzquierdoAbierto] = useState(true);
@@ -1542,7 +1544,7 @@ export default function App() {
                 días cerrados, feriados, vacaciones, francos, objetivo del mes y el modo claro/
                 oscuro), como en Google Calendar. */}
             <button
-              onClick={() => { setRestauracion(null); setConfigAbierta(true); }}
+              onClick={() => { setRestauracion(null); setBorrarLocalPendiente(false); setConfigAbierta(true); }}
               style={S.configBtn}
               title="Configuración del local"
               aria-haspopup="dialog"
@@ -1818,26 +1820,15 @@ export default function App() {
           onMouseDown={(e) => { if (e.target === e.currentTarget) setConfigAbierta(false); }}
         >
           <div className="modalPanel" role="dialog" aria-modal="true" aria-label="Configuración del local">
+            {/* El encabezado sólo dice QUÉ local se está configurando. El nombre se edita abajo,
+                en un campo con su etiqueta: acá arriba parecía un título y nadie se daba cuenta
+                de que se podía escribir. */}
             <div style={S.modalHeaderRow}>
               <div style={S.modalHeaderTitulo}>
                 <div style={S.eyebrowLine}>// CONFIGURACIÓN DEL LOCAL</div>
-                <input
-                  value={local.nombre}
-                  onChange={(e) => updateLocal({ nombre: e.target.value })}
-                  style={S.nameInput}
-                  placeholder="Nombre del local"
-                />
+                <div style={S.sectionTitle}>{local.nombre || "Sin nombre"}</div>
               </div>
               <div style={S.modalHeaderBotones}>
-                {sharedData.locales.length > 1 && (
-                  <button
-                    onClick={() => { removeLocal(local.id); setConfigAbierta(false); }}
-                    style={S.iconGhost}
-                    title="Borrar este local"
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                )}
                 <button
                   onClick={() => setConfigAbierta(false)}
                   style={S.modalCerrarBtn}
@@ -1851,6 +1842,16 @@ export default function App() {
 
             <div className="modalScroll" style={S.modalBody}>
               <label style={S.field}>
+                <span style={S.label}>Nombre del local</span>
+                <input
+                  value={local.nombre}
+                  onChange={(e) => updateLocal({ nombre: e.target.value })}
+                  style={S.input}
+                  placeholder="Ej: Rivadavia"
+                />
+              </label>
+
+              <label style={{ ...S.field, marginTop: 12 }}>
                 <span style={S.label}>Objetivo del mes</span>
                 <MoneyInput
                   value={local.objetivoTotal}
@@ -2050,6 +2051,33 @@ export default function App() {
                   >🌙 Oscuro</button>
                 </div>
               </div>
+
+              {/* Borrar el local: al final de todo, con el nombre a la vista y confirmación en dos
+                  pasos. Antes era un tachito sin texto arriba del todo — imposible saber qué
+                  borraba, y peligrosamente cerca del botón de cerrar. */}
+              {sharedData.locales.length > 1 && (
+                <div style={S.cerradosBlock}>
+                  <span style={S.label}>Borrar este local</span>
+                  <div style={S.miniStat}>
+                    Se borra <b>{local.nombre || "este local"}</b> con sus vendedores y todos sus horarios. Los demás locales no se tocan.
+                  </div>
+                  {borrarLocalPendiente ? (
+                    <div style={S.respaldoBotones}>
+                      <button
+                        onClick={() => { setBorrarLocalPendiente(false); removeLocal(local.id); setConfigAbierta(false); }}
+                        style={S.borrarLocalBtn}
+                      >
+                        <Trash2 size={13} /> Sí, borrar “{local.nombre || "este local"}”
+                      </button>
+                      <button onClick={() => setBorrarLocalPendiente(false)} style={S.copyBtn}>Cancelar</button>
+                    </div>
+                  ) : (
+                    <button onClick={() => setBorrarLocalPendiente(true)} style={S.borrarLocalBtn}>
+                      <Trash2 size={13} /> Borrar “{local.nombre || "este local"}”
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -2869,6 +2897,11 @@ const S = {
   restaurarAviso: {
     marginTop: 8, background: DANGER_BG, color: DANGER, borderRadius: 10,
     padding: "10px", fontSize: 12, lineHeight: 1.45,
+  },
+  borrarLocalBtn: {
+    display: "flex", alignItems: "center", gap: 6, marginTop: 8,
+    fontSize: 12.5, fontWeight: 700, color: DANGER, background: DANGER_BG,
+    border: "none", borderRadius: 8, padding: "9px 12px", cursor: "pointer",
   },
   panelToggleBtn: {
     width: 26, height: 26, borderRadius: 8, border: "none", background: SURFACE_2, color: INK,
