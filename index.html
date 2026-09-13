@@ -624,6 +624,11 @@ function App() {
   // Google Calendar. Antes era un acordeón dentro del panel izquierdo, y aunque esté plegado le
   // ocupaba lugar todos los días a lo que sí se usa seguido (vendedores + horario del día).
   const [configAbierta, setConfigAbierta] = useState(false);
+  // Restauración pendiente de confirmar: { datos, descripcion, resumen, dias } | { error }.
+  // La confirmación se hace DENTRO del ⚙ y no con window.confirm porque el navegador puede
+  // suprimir esos carteles ("no permitir más diálogos") y entonces la restauración no se hacía
+  // y no avisaba nada — pasaba en silencio, que es lo peor que puede hacer un botón así.
+  const [restauracion, setRestauracion] = useState(null);
   // Panel izquierdo (vendedores + horario del día) plegable con el ☰, como el menú de Google
   // Calendar: al plegarlo el calendario se estira y se lee mejor (y sale mejor la foto para el grupo).
   const [panelIzquierdoAbierto, setPanelIzquierdoAbierto] = useState(true);
@@ -1174,25 +1179,34 @@ function App() {
       mostrarToast("No se pudo descargar la copia.");
     }
   };
-  const restaurarDatos = (crudos, descripcion) => {
+  // Paso 1: se lee la copia y se muestra un resumen para confirmar (dentro del ⚙, ver el
+  // comentario del estado "restauracion"). Nada se toca todavía.
+  const prepararRestauracion = (crudos, descripcion) => {
     if (!crudos || !Array.isArray(crudos.locales) || crudos.locales.length === 0) {
-      mostrarToast("Ese archivo no parece una copia de la app.");
+      setRestauracion({ error: "Ese archivo no parece una copia de la app. Tiene que ser el .json que genera “Descargar copia”." });
       return;
     }
     const datos = migrarDatos(crudos);
-    const resumen = datos.locales.map((l) => l.nombre || "Local").join(", ");
-    const ok = window.confirm(
-      `Restaurar ${descripcion} va a REEMPLAZAR todo lo que hay cargado ahora — para todos los que usan el link — por: ${resumen} (${contarDiasCargados(datos)} días con horario cargado).\n\n¿Confirmás? (después lo podés deshacer con Ctrl+Z)`
-    );
-    if (!ok) return;
+    setRestauracion({
+      datos,
+      descripcion,
+      resumen: datos.locales.map((l) => l.nombre || "Local").join(", "),
+      dias: contarDiasCargados(datos),
+    });
+  };
+  // Paso 2: confirmado. Reemplaza el documento entero (queda deshacible con ↩ / Ctrl+Z).
+  const confirmarRestauracion = () => {
+    if (!restauracion || !restauracion.datos) return;
+    const { datos, dias } = restauracion;
     pushUndo({ tipo: "documento", anterior: sharedData });
     setSharedData(datos);
     setLocalActivoId(datos.locales[0].id);
     setVendedorActivo(datos.locales[0].vendedores[0]?.id || null);
     setFechaSeleccionada(null);
     setDiasParaCopiar(new Set());
+    setRestauracion(null);
     setConfigAbierta(false);
-    mostrarToast("Copia restaurada", { deshacible: true });
+    mostrarToast(`Copia restaurada · ${dias} días con horario`, { deshacible: true });
   };
 
   const cambiarMes = (delta) => {
@@ -1611,7 +1625,7 @@ function App() {
                 días cerrados, feriados, vacaciones, francos, objetivo del mes y el modo claro/
                 oscuro), como en Google Calendar. */}
             <button
-              onClick={() => setConfigAbierta(true)}
+              onClick={() => { setRestauracion(null); setConfigAbierta(true); }}
               style={S.configBtn}
               title="Configuración del local"
               aria-haspopup="dialog"
@@ -2052,9 +2066,9 @@ function App() {
                         const lector = new FileReader();
                         lector.onload = () => {
                           try {
-                            restaurarDatos(JSON.parse(lector.result), `la copia "${archivo.name}"`);
+                            prepararRestauracion(JSON.parse(lector.result), `la copia "${archivo.name}"`);
                           } catch (err) {
-                            mostrarToast("No se pudo leer ese archivo.");
+                            setRestauracion({ error: `No se pudo leer "${archivo.name}": no es un archivo .json válido.` });
                           }
                         };
                         lector.readAsText(archivo);
@@ -2062,6 +2076,22 @@ function App() {
                     />
                   </label>
                 </div>
+                {restauracion && restauracion.error && (
+                  <div style={S.restaurarAviso}>{restauracion.error}</div>
+                )}
+                {restauracion && restauracion.datos && (
+                  <div style={S.restaurarConfirma}>
+                    <div style={S.restaurarTexto}>
+                      Vas a reemplazar <b>todo lo que hay cargado ahora</b> — para todos los que usan el link — por {restauracion.descripcion}:
+                      <br />
+                      <b>{restauracion.resumen}</b> · {restauracion.dias} días con horario.
+                    </div>
+                    <div style={S.respaldoBotones}>
+                      <button onClick={confirmarRestauracion} style={S.addBtn}>Sí, restaurar</button>
+                      <button onClick={() => setRestauracion(null)} style={S.copyBtn}>Cancelar</button>
+                    </div>
+                  </div>
+                )}
                 {respaldos.length > 0 ? (
                   <>
                     <span style={{ ...S.label, marginTop: 10, display: "block" }}>Copias automáticas de este dispositivo</span>
@@ -2072,9 +2102,9 @@ function App() {
                           <button
                             onClick={() => {
                               try {
-                                restaurarDatos(JSON.parse(r.datos), `la copia del ${fmtFechaHoraCorta(r.fecha)}`);
+                                prepararRestauracion(JSON.parse(r.datos), `la copia del ${fmtFechaHoraCorta(r.fecha)}`);
                               } catch (err) {
-                                mostrarToast("Esa copia está dañada.");
+                                setRestauracion({ error: "Esa copia está dañada." });
                               }
                             }}
                             style={S.copyBtn}
@@ -2914,6 +2944,15 @@ const S = {
     background: SURFACE_2, borderRadius: 8, padding: "6px 8px",
   },
   respaldoFecha: { fontSize: 11.5, fontWeight: 600, color: INK },
+  restaurarConfirma: {
+    marginTop: 8, background: WARN_BG, borderRadius: 10, padding: "10px",
+    display: "flex", flexDirection: "column", gap: 9,
+  },
+  restaurarTexto: { fontSize: 12, color: INK, lineHeight: 1.45 },
+  restaurarAviso: {
+    marginTop: 8, background: DANGER_BG, color: DANGER, borderRadius: 10,
+    padding: "10px", fontSize: 12, lineHeight: 1.45,
+  },
   panelToggleBtn: {
     width: 26, height: 26, borderRadius: 8, border: "none", background: SURFACE_2, color: INK,
     fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
