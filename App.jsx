@@ -16,6 +16,11 @@ import {
 const STORAGE_KEY = "vdh-objetivo-calendario"; // fallback localStorage (sin capacidad "db")
 const UI_PREFS_KEY = "vdh-objetivo-ui-prefs"; // preferencias locales de navegación (no se comparten)
 const TEMA_KEY = "vdh-objetivo-tema";
+// Respaldo automático en ESTE dispositivo: cada vez que llegan datos buenos del servidor se
+// guarda una copia. Es la red de seguridad que faltó el 11/09/2026, cuando se perdió todo un mes
+// de horarios cargados y no había ninguna copia de dónde sacarlos.
+const RESPALDOS_KEY = "vdh-objetivo-respaldos";
+const RESPALDOS_MAX = 5;
 const DB_DOC_PATH = "app/data"; // documento compartido cuando la capacidad "db" está disponible
 const DATA_VERSION = 5;
 const DIAS_SEMANA = ["L", "M", "M", "J", "V", "S", "D"];
@@ -175,6 +180,12 @@ function vendedoresDeFranco(vendedores, y, m, d) {
 function fmtFechaCorta(iso) {
   const [y, m, d] = iso.split("-");
   return `${d}/${m}/${y}`;
+}
+// Fecha + hora de una copia de seguridad ("13/09 17:55"), para poder elegir cuál restaurar.
+function fmtFechaHoraCorta(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  return `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
 // Domingo de Pascua (algoritmo de Meeus/Jones/Butcher), para ubicar Carnaval y Viernes Santo.
@@ -481,6 +492,9 @@ export default function App() {
     const accion = undoStack.current.pop();
     if (!accion) return;
     setSharedData((d) => {
+      // Restaurar una copia de seguridad reemplaza el documento entero: deshacer lo deja
+      // exactamente como estaba justo antes de restaurar.
+      if (accion.tipo === "documento") return accion.anterior;
       if (accion.tipo === "local") {
         // Restaura ese local puntual a como estaba; a los demás locales no los toca, sin
         // importar qué les haya pasado mientras tanto.
@@ -623,6 +637,39 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
+  // ---- Respaldo automático (en este dispositivo) ----
+  // Cada vez que el SERVIDOR manda datos con horarios cargados, se guarda una copia acá. Nunca
+  // se respalda una base vacía: la gracia es tener siempre a mano el último estado bueno.
+  const leerRespaldos = () => {
+    try {
+      const arr = JSON.parse(localStorage.getItem(RESPALDOS_KEY) || "[]");
+      return Array.isArray(arr) ? arr : [];
+    } catch (e) { return []; }
+  };
+  const contarDiasCargados = (data) => {
+    if (!data || !Array.isArray(data.locales)) return 0;
+    return data.locales.reduce((s, l) => s + (l.vendedores || []).reduce(
+      (s2, v) => s2 + Object.keys(v.dias || {}).length, 0), 0);
+  };
+  const guardarRespaldo = (data) => {
+    try {
+      const dias = contarDiasCargados(data);
+      if (dias === 0) return;
+      const serializado = JSON.stringify(data);
+      const previos = leerRespaldos();
+      if (previos[0] && previos[0].datos === serializado) return; // sin cambios, no duplicamos
+      let nuevos = [{ fecha: new Date().toISOString(), dias, datos: serializado }, ...previos].slice(0, RESPALDOS_MAX);
+      while (nuevos.length > 0) {
+        try {
+          localStorage.setItem(RESPALDOS_KEY, JSON.stringify(nuevos));
+          return;
+        } catch (e) {
+          nuevos = nuevos.slice(0, nuevos.length - 1); // no entra: se van soltando las más viejas
+        }
+      }
+    } catch (e) {}
+  };
+
   // Carga inicial: intenta la capacidad "db" (compartida entre dispositivos); si no está
   // disponible, usa localStorage (solo este dispositivo).
   useEffect(() => {
@@ -661,13 +708,34 @@ export default function App() {
       setSyncMode("db");
       const ref = db.doc(DB_DOC_PATH);
       dbDocRef.current = ref;
+      // Si el servidor no contesta (sin internet), a los 8 segundos se sigue en modo local en vez
+      // de quedarse para siempre en la pantalla de carga. En ese modo NO se escribe la base
+      // compartida: lo que se toque queda solo en este dispositivo.
+      let contestoElServidor = false;
+      const timeoutSinServidor = setTimeout(() => {
+        if (!cancelled && !contestoElServidor) cargarLocalStorage();
+      }, 8000);
       unsub = ref.onSnapshot(
         (snap) => {
           if (cancelled) return;
+          // ⚠ CUIDADO: una foto VACÍA que viene del caché NO significa "la base está vacía". Es lo
+          // que entrega el servidor cuando el dispositivo está sin internet (o antes de la primera
+          // respuesta). Acá antes se creaban los datos de fábrica y se escribían con ref.set(): al
+          // volver la conexión, esa escritura pisaba los horarios de TODOS los locales. Pasó de
+          // verdad el 11/09/2026 — alcanzó con que alguien abriera el link con mala señal para
+          // perder un mes entero de carga. Sin confirmación del servidor no se escribe NADA.
+          const vieneDelCache = !!(snap.metadata && snap.metadata.fromCache);
+          if (!snap.exists && vieneDelCache) return;
+          contestoElServidor = true;
+          clearTimeout(timeoutSinServidor);
+          setSyncMode("db"); // por si el timeout ya había pasado a modo local
           let actual;
           if (snap.exists) {
             actual = migrarDatos(snap.data());
+            guardarRespaldo(actual);
           } else {
+            // Acá sí: el servidor confirma que el documento no existe (primera vez que se abre la
+            // app, o alguien lo borró a mano).
             actual = defaultSharedData();
             ref.set(actual).catch(() => {});
           }
@@ -678,6 +746,7 @@ export default function App() {
         () => {
           // La suscripción murió (revocado, o el puente dejó de responder): seguimos
           // funcionando localmente para no perder la app por un problema de red.
+          clearTimeout(timeoutSinServidor);
           if (!cancelled) cargarLocalStorage();
         }
       );
@@ -1001,6 +1070,48 @@ export default function App() {
     mostrarToast(`Se eliminó el local "${localAnterior.nombre || "Local"}"`, { deshacible: true });
   };
 
+  // ---- Copias de seguridad: descargar una, o restaurar (de un archivo o del respaldo automático) ----
+  // Restaurar pisa TODO el documento compartido, así que siempre pregunta antes y queda
+  // deshacible (↩ Deshacer / Ctrl+Z).
+  const descargarCopia = () => {
+    try {
+      const ahora = new Date();
+      const nombre = `Horarios VDH - copia ${ahora.getFullYear()}-${pad2(ahora.getMonth() + 1)}-${pad2(ahora.getDate())} ${pad2(ahora.getHours())}.${pad2(ahora.getMinutes())}.json`;
+      const blob = new Blob([JSON.stringify(sharedData, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = nombre;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 3000);
+      mostrarToast("Copia descargada");
+    } catch (e) {
+      mostrarToast("No se pudo descargar la copia.");
+    }
+  };
+  const restaurarDatos = (crudos, descripcion) => {
+    if (!crudos || !Array.isArray(crudos.locales) || crudos.locales.length === 0) {
+      mostrarToast("Ese archivo no parece una copia de la app.");
+      return;
+    }
+    const datos = migrarDatos(crudos);
+    const resumen = datos.locales.map((l) => l.nombre || "Local").join(", ");
+    const ok = window.confirm(
+      `Restaurar ${descripcion} va a REEMPLAZAR todo lo que hay cargado ahora — para todos los que usan el link — por: ${resumen} (${contarDiasCargados(datos)} días con horario cargado).\n\n¿Confirmás? (después lo podés deshacer con Ctrl+Z)`
+    );
+    if (!ok) return;
+    pushUndo({ tipo: "documento", anterior: sharedData });
+    setSharedData(datos);
+    setLocalActivoId(datos.locales[0].id);
+    setVendedorActivo(datos.locales[0].vendedores[0]?.id || null);
+    setFechaSeleccionada(null);
+    setDiasParaCopiar(new Set());
+    setConfigAbierta(false);
+    mostrarToast("Copia restaurada", { deshacible: true });
+  };
+
   const cambiarMes = (delta) => {
     setMesVista((mv) => {
       let m = mv.month + delta, y = mv.year;
@@ -1266,6 +1377,9 @@ export default function App() {
   const montoTotal = filas.reduce((s, f) => s + f.monto, 0);
 
   const vActivo = local.vendedores.find((v) => v.id === vendedorActivo) || local.vendedores[0];
+  // Copias automáticas guardadas en este dispositivo. Se leen solo con el ⚙ abierto, que es
+  // donde se muestran (leer localStorage en cada render del calendario no tendría sentido).
+  const respaldos = configAbierta ? leerRespaldos() : [];
 
   const fechaDiaVista = fechaSeleccionada || hoyComoFecha();
   const diasGrilla = vista === "semana"
@@ -1831,6 +1945,63 @@ export default function App() {
                       </span>
                     ))}
                   </div>
+                )}
+              </div>
+
+              {/* Copia de seguridad: la red que faltó el 11/09/2026, cuando se perdió un mes
+                  entero de horarios y no había de dónde sacarlos. Las copias automáticas viven en
+                  ESTE dispositivo (una cada vez que llegan datos nuevos del servidor); la descarga
+                  es un archivo que se puede guardar donde sea y restaurar desde cualquier lado. */}
+              <div style={S.cerradosBlock}>
+                <span style={S.label}>Copia de seguridad</span>
+                <div style={S.respaldoBotones}>
+                  <button onClick={descargarCopia} style={S.copyBtn}>Descargar copia</button>
+                  <label role="button" tabIndex={0} style={S.copyBtn}>
+                    Restaurar desde archivo
+                    <input
+                      type="file"
+                      accept="application/json,.json"
+                      style={{ display: "none" }}
+                      onChange={(e) => {
+                        const archivo = e.target.files && e.target.files[0];
+                        e.target.value = "";
+                        if (!archivo) return;
+                        const lector = new FileReader();
+                        lector.onload = () => {
+                          try {
+                            restaurarDatos(JSON.parse(lector.result), `la copia "${archivo.name}"`);
+                          } catch (err) {
+                            mostrarToast("No se pudo leer ese archivo.");
+                          }
+                        };
+                        lector.readAsText(archivo);
+                      }}
+                    />
+                  </label>
+                </div>
+                {respaldos.length > 0 ? (
+                  <>
+                    <span style={{ ...S.label, marginTop: 10, display: "block" }}>Copias automáticas de este dispositivo</span>
+                    <div style={S.respaldoLista}>
+                      {respaldos.map((r, i) => (
+                        <div key={i} style={S.respaldoFila}>
+                          <span style={S.respaldoFecha}>{fmtFechaHoraCorta(r.fecha)} · {r.dias} días cargados</span>
+                          <button
+                            onClick={() => {
+                              try {
+                                restaurarDatos(JSON.parse(r.datos), `la copia del ${fmtFechaHoraCorta(r.fecha)}`);
+                              } catch (err) {
+                                mostrarToast("Esa copia está dañada.");
+                              }
+                            }}
+                            style={S.copyBtn}
+                          >Restaurar</button>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                ) : (
+                  <div style={S.miniStat}>Todavía no hay copias en este dispositivo. Se guarda una cada vez que llegan horarios nuevos del servidor.</div>
                 )}
               </div>
 
@@ -2653,6 +2824,13 @@ const S = {
   },
   modalBody: { padding: "13px 15px 16px" },
   temaSwitchRow: { display: "flex", gap: 6, marginTop: 6 },
+  respaldoBotones: { display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 },
+  respaldoLista: { display: "flex", flexDirection: "column", gap: 5, marginTop: 6 },
+  respaldoFila: {
+    display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8,
+    background: SURFACE_2, borderRadius: 8, padding: "6px 8px",
+  },
+  respaldoFecha: { fontSize: 11.5, fontWeight: 600, color: INK },
   panelToggleBtn: {
     width: 26, height: 26, borderRadius: 8, border: "none", background: SURFACE_2, color: INK,
     fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
